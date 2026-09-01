@@ -3,8 +3,13 @@
 #SBATCH --output=logs/gfn_%j.out
 #SBATCH --error=logs/gfn_%j.out
 #SBATCH --time=24:00:00
-#SBATCH --cpus-per-task=2
-#SBATCH --mem=8G
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=32G
+# NOTE: more MEMORY helps, more CORES does not -- we pin torch to a single
+# thread on purpose (see below), so extra cores sit idle. Raise memory with
+# sbatch --mem=64G ... (shell vars do NOT expand in #SBATCH lines; the
+# command-line flag overrides the directive). Lower MICRO= if it still OOMs.
+#
 # CPU only. The tensors here are tiny (B x N x N with N <= 175) and the loop is
 # Python-bound in the env, so a GPU buys little. What DOES matter is thread
 # count: on a 40-core node torch defaulted to 40 threads and ran ~95,000x
@@ -56,6 +61,7 @@ srun python3 -m topo_gfn.train \
   --num-emb 128 --num-layers 4 --rank 32 \
   --lr 1e-4 --lr-z 1e-3 \
   --threads 1 \
+  --micro-batch "${MICRO:-8}" \
   --seed "$SEED" \
   --log-every 0 --ckpt-every 50 \
   --device cpu \

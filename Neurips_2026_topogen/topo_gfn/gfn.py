@@ -42,15 +42,22 @@ FAIL_LOGR = -50.0
 
 @dataclass
 class Trajectory:
-    """One rollout.  ``log_pf`` and ``log_pb`` are summed over the trajectory."""
+    """One rollout.
+
+    Rollout happens under no_grad and only RECORDS (state, action) pairs;
+    log P_F is recomputed in the loss.  Building the autograd graph during the
+    rollout instead retains every step's activations -- at 149 steps x batch 64
+    x (126x126) pair logits that is several GB, and it OOM-killed every enzymes
+    job at 8GB.  torchgfn and SynFlowNet both recompute for the same reason.
+    """
     env: TopoEnv
-    log_pf: torch.Tensor                    # scalar, differentiable
-    log_pb: float                           # scalar, constant (uniform P_B)
+    log_pb: float                           # constant (uniform P_B)
     terminal: State
     completed: bool
     n_steps: int
+    states: List[State] = field(default_factory=list)   # visited, pre-action
+    actions: List[object] = field(default_factory=list)  # ActionIndex per state
     log_reward: float = 0.0
-    states: List[State] = field(default_factory=list)
 
 
 class TopoSampler:
@@ -61,19 +68,17 @@ class TopoSampler:
         self.max_steps_slack = max_steps_slack
 
     @torch.no_grad()
-    def _noop(self):
-        pass
-
     def sample(self, envs: List[TopoEnv], cond: Optional[torch.Tensor] = None,
-               keep_states: bool = False) -> List[Trajectory]:
+               keep_states: bool = True) -> List[Trajectory]:
+        """Roll out under no_grad, recording (state, action) for the loss."""
         B = len(envs)
         states = [e.new() for e in envs]
-        log_pf = [torch.zeros((), device=self._device()) for _ in range(B)]
         log_pb = [0.0] * B
         steps = [0] * B
         active = [True] * B
         completed = [False] * B
-        seen = [[s] for s in states] if keep_states else [[] for _ in range(B)]
+        seen = [[] for _ in range(B)]
+        acts_taken = [[] for _ in range(B)]
 
         # every trajectory is exactly sched.num_edges moves plus Stop
         budget = max(e.sched.num_edges for e in envs) + self.max_steps_slack
@@ -101,12 +106,12 @@ class TopoSampler:
                                     None if cond is None else cond[still].to(dev))
             cat = TopoActionCategorical(tl, ml, cl, tm, mm, cm)
             aidx = cat.sample()
-            lp = cat.log_prob(aidx)
 
             for j, i in enumerate(still):
                 env = envs[i]
                 a = env.ctx.ActionIndex_to_GraphAction(aidx[j])
-                log_pf[i] = log_pf[i] + lp[j]
+                seen[i].append(states[i])
+                acts_taken[i].append(aidx[j])
                 if a.action is GraphActionType.Stop:
                     active[i] = False
                     completed[i] = True
@@ -117,13 +122,11 @@ class TopoSampler:
                 log_pb[i] += -np.log(max(1, npar))
                 states[i] = nxt
                 steps[i] += 1
-                if keep_states:
-                    seen[i].append(nxt)
 
         return [
-            Trajectory(env=envs[i], log_pf=log_pf[i], log_pb=log_pb[i],
-                       terminal=states[i], completed=completed[i],
-                       n_steps=steps[i], states=seen[i])
+            Trajectory(env=envs[i], log_pb=log_pb[i], terminal=states[i],
+                       completed=completed[i], n_steps=steps[i],
+                       states=seen[i], actions=acts_taken[i])
             for i in range(B)
         ]
 
@@ -148,37 +151,80 @@ class TrajectoryBalance:
         adj = traj.terminal.adj[:n, :n]
         return float(self.beta * self.scorer.score(adj))
 
-    def compute_loss(self, trajs: List[Trajectory],
-                     cond: Optional[torch.Tensor] = None):
-        dev = next(self.model.parameters()).device
-        logZ = self.model.logZ(cond).squeeze(-1)          # (B,) or (1,)
-        if logZ.numel() == 1 and len(trajs) > 1:
-            logZ = logZ.expand(len(trajs))
+    def _log_pf(self, trajs: List[Trajectory], chunk: int = 256) -> torch.Tensor:
+        """Recompute sum_t log P_F(a_t | s_t) per trajectory.
 
-        logr, lpf, lpb = [], [], []
+        Flattens every (state, action) pair across the given trajectories and
+        re-runs the model in chunks, scattering the per-step log-probs back to
+        their trajectory with a differentiable index_add.
+        """
+        dev = next(self.model.parameters()).device
+        flat_s, flat_a, owner = [], [], []
+        for ti, t in enumerate(trajs):
+            for s, a in zip(t.states, t.actions):
+                flat_s.append(s)
+                flat_a.append(a)
+                owner.append(ti)
+
+        out = torch.zeros(len(trajs), device=dev)
+        if not flat_s:
+            return out
+        idx = torch.tensor(owner, dtype=torch.long, device=dev)
+
+        for i in range(0, len(flat_s), chunk):
+            bs = flat_s[i:i + chunk]
+            ba = flat_a[i:i + chunk]
+            x, adj, nm = batch_states(bs)
+            tm, mm, cm = batch_masks(bs)
+            tl, ml, cl = self.model(x.to(dev), adj.to(dev), nm.to(dev))
+            cat = TopoActionCategorical(tl, ml, cl, tm, mm, cm)
+            out = out.index_add(0, idx[i:i + chunk], cat.log_prob(ba))
+        return out
+
+    def backward_and_info(self, trajs: List[Trajectory], micro_bs: int = 8,
+                          chunk: int = 256, cond: Optional[torch.Tensor] = None):
+        """Accumulate the TB gradient over micro-batches of trajectories.
+
+        The loss is per-trajectory, so sum log P_F for one trajectory must live
+        in the graph all at once -- but different trajectories need not.  Doing
+        backward per micro-batch therefore bounds peak memory by micro_bs
+        rollouts instead of the full batch, which is what the enzymes OOM was.
+        """
+        dev = next(self.model.parameters()).device
         for t in trajs:
             t.log_reward = self.log_reward(t)
-            logr.append(t.log_reward)
-            lpf.append(t.log_pf)
-            lpb.append(t.log_pb)
 
-        log_r = torch.tensor(logr, dtype=torch.float32, device=dev)
-        log_pf = torch.stack(lpf).to(dev)
-        log_pb = torch.tensor(lpb, dtype=torch.float32, device=dev)
+        n = len(trajs)
+        tot_loss = 0.0
+        pf_all, resid_all = [], []
+        for i in range(0, n, micro_bs):
+            mb = trajs[i:i + micro_bs]
+            logZ = self.model.logZ(cond).squeeze(-1)
+            if logZ.numel() == 1:
+                logZ = logZ.expand(len(mb))
+            log_pf = self._log_pf(mb, chunk=chunk)
+            log_r = torch.tensor([t.log_reward for t in mb], dtype=torch.float32, device=dev)
+            log_pb = torch.tensor([t.log_pb for t in mb], dtype=torch.float32, device=dev)
 
-        resid = logZ + log_pf - log_r - log_pb
-        loss = (resid ** 2).mean()
+            resid = logZ + log_pf - log_r - log_pb
+            loss_mb = (resid ** 2).mean() * (len(mb) / n)
+            loss_mb.backward()
 
+            tot_loss += float(loss_mb.detach())
+            pf_all.append(log_pf.detach())
+            resid_all.append(resid.detach())
+
+        log_pf_d = torch.cat(pf_all) if pf_all else torch.zeros(0)
         info = {
-            "loss": float(loss.detach()),
-            "logZ": float(logZ.detach().mean()),
-            "log_pf": float(log_pf.detach().mean()),
-            "log_pb": float(log_pb.mean()),
-            "log_r": float(log_r.mean()),
+            "loss": tot_loss,
+            "logZ": float(self.model.logZ(cond).detach().mean()),
+            "log_pf": float(log_pf_d.mean()) if len(log_pf_d) else 0.0,
+            "log_pb": float(np.mean([t.log_pb for t in trajs])),
+            "log_r": float(np.mean([t.log_reward for t in trajs])),
             "completion_rate": float(np.mean([t.completed for t in trajs])),
             "mean_steps": float(np.mean([t.n_steps for t in trajs])),
         }
         done = [t for t in trajs if t.completed]
         if done:
             info["log_r_completed"] = float(np.mean([t.log_reward for t in done]))
-        return loss, info
+        return tot_loss, info

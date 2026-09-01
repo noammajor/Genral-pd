@@ -68,6 +68,18 @@ def main():
     ap.add_argument("--n-iterations", type=int, default=10000,
                     help="total gradient steps; used only if --n-epochs is unset")
     ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--micro-batch", type=int, default=8,
+                    help="trajectories per backward pass. Peak memory scales "
+                         "with this, not --batch-size: log P_F for ONE trajectory "
+                         "must be in the graph at once, but different "
+                         "trajectories need not be. Lower this if OOM.")
+    ap.add_argument("--recompute-chunk", type=int, default=256,
+                    help="states per forward pass when recomputing log P_F")
+    ap.add_argument("--size-buckets", action="store_true", default=True,
+                    help="batch targets of similar node count together, so "
+                         "padding to the batch max does not blow up the (N,N) "
+                         "tensors (enzymes spans n=10..126)")
+    ap.add_argument("--no-size-buckets", dest="size_buckets", action="store_false")
     ap.add_argument("--beta", type=float, default=1.0,
                     help="inverse temperature on s(H); 0 = completion-only reward")
     ap.add_argument("--constant-scorer", action="store_true",
@@ -153,21 +165,33 @@ def main():
         if stop:
             break
         perm = rng.permutation(len(train))          # full pass, no replacement
+        if args.size_buckets:
+            # Group targets of similar N into a batch. batch_states pads to the
+            # batch's largest N, so mixing n=10 with n=126 (enzymes' full range)
+            # inflates every small graph 150x in the (N,N) pair tensors. Sorting
+            # by size first keeps each batch homogeneous; the shuffle above plus
+            # the batch-order shuffle below keep it stochastic, and it is still
+            # a full pass over every target exactly once.
+            perm = perm[np.argsort([train[i][0].num_nodes for i in perm],
+                                   kind="stable")]
+        batches = [perm[b0:b0 + args.batch_size]
+                   for b0 in range(0, len(perm), args.batch_size)]
+        if args.size_buckets:
+            rng.shuffle(batches)
         ep_stats = []
-        for b0 in range(0, len(perm), args.batch_size):
+        for pick in batches:
             it += 1
             if it > total_iters:
                 stop = True
                 break
-            pick = perm[b0:b0 + args.batch_size]
             envs = [TopoEnv(train[i][0]) for i in pick]
 
             trajs = sampler.sample(envs)
-            loss, info = algo.compute_loss(trajs)
 
             opt.zero_grad(set_to_none=True)
             opt_z.zero_grad(set_to_none=True)
-            loss.backward()
+            _, info = algo.backward_and_info(
+                trajs, micro_bs=args.micro_batch, chunk=args.recompute_chunk)
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
             opt_z.step()
