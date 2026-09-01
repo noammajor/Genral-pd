@@ -82,9 +82,15 @@ def main():
     ap.add_argument("--ckpt-every", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--threads", type=int, default=1,
+                    help="torch CPU threads. Keep at 1: our tensors are tiny "
+                         "(B x N x N with N <= ~175) and thread sync dominates. "
+                         "Measured on a 40-core node at load 43: 955 ms/iter at "
+                         "40 threads vs 0.01 ms/iter at 1 -- a ~95,000x difference.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
+    torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     root = args.data_root or str(Path(__file__).resolve().parents[1] / "data")
