@@ -32,7 +32,11 @@ results/
 
 # --- datasets and derived artefacts (large, regenerable) ---
 # Regenerate with: python dump_data.py dataset=<name>
-Neurips_2026_topogen/data/
+# Datasets live at the repo root and are synced to compute nodes with rsync,
+# not through git (~91MB).
+/data/
+# no trailing slash: also matches the convenience symlink -> ../data
+Neurips_2026_topogen/data
 Neurips_2026_topogen/baselines/ConStruct/data/
 *.pt
 *.pkl
