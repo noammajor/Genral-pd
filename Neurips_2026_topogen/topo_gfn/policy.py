@@ -261,11 +261,23 @@ class TopoActionCategorical:
 
     # -- sampling -----------------------------------------------------------
 
+    @staticmethod
+    def _gumbel_like(t: torch.Tensor) -> torch.Tensor:
+        """Standard Gumbel noise, -log(-log(U)).
+
+        Parenthesised explicitly: writing ``-torch.log(-torch.log(u).clamp_min(e))``
+        binds the method call tighter than the unary minus, which clamps the
+        NEGATIVE inner log up to +e, negates it, and then takes the log of a
+        negative number -> NaN.  That silently makes every logit NaN and argmax
+        return index 0.
+        """
+        u = torch.rand_like(t).clamp_(min=1e-20, max=1.0 - 1e-7)
+        return -torch.log(-torch.log(u))
+
     def sample(self) -> List[ActionIndex]:
         """Gumbel-argmax at each level, as SynFlowNet does."""
         tlp = self.type_logprobs()
-        gt = -torch.log(-torch.log(torch.rand_like(tlp).clamp_min(1e-30)).clamp_min(1e-30))
-        t_idx = (tlp + gt).argmax(dim=-1)
+        t_idx = (tlp + self._gumbel_like(tlp)).argmax(dim=-1)
 
         out = []
         mlp_ = self.merge_logprobs()
@@ -276,8 +288,7 @@ class TopoActionCategorical:
                 out.append(ActionIndex(action_type=t, row_idx=0, col_idx=0))
                 continue
             lp = (mlp_ if t == self.i_merge else clp)[i]
-            g = -torch.log(-torch.log(torch.rand_like(lp).clamp_min(1e-30)).clamp_min(1e-30))
-            flat = (lp + g).reshape(-1).argmax()
+            flat = (lp + self._gumbel_like(lp)).reshape(-1).argmax()
             out.append(ActionIndex(action_type=t,
                                    row_idx=int(flat // N), col_idx=int(flat % N)))
         return out
