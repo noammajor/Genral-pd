@@ -1,0 +1,40 @@
+# --- OS / editor ---
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# --- environments ---
+.venv/
+venv/
+env/
+
+# --- experiment outputs ---
+outputs/
+runs/
+logs/
+slurm-*.out
+wandb/
+checkpoints/
+*.ckpt
+dumps/
+results/
+
+# --- datasets and derived artefacts (large, regenerable) ---
+# Regenerate with: python dump_data.py dataset=<name>
+Neurips_2026_topogen/data/
+Neurips_2026_topogen/baselines/ConStruct/data/
+*.pt
+*.pkl
+*.npy
+!Neurips_2026_topogen/topo_gfn/**/*.npy

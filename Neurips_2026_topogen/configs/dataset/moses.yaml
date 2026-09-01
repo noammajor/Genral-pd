@@ -1,0 +1,7 @@
+# Adapted from DiGress configs/dataset/moses.yaml
+name: moses
+datadir: 'data/moses'
+remove_h: null
+filter: False
+adaptive_loader: False
+fraction: 1.0

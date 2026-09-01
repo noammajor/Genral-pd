@@ -1,0 +1,8 @@
+# Adapted from DiGress configs/dataset/qm9.yaml
+name: qm9
+datadir: 'data/qm9'
+remove_h: True          # True = remove hydrogens (standard setting in DiGress/ConStruct)
+random_subset: null
+pin_memory: False
+adaptive_loader: False
+fraction: 1.0

@@ -1,0 +1,35 @@
+# DiGress-equivalent model settings
+# Same architecture as construct.yaml but with marginal transition and no rev_proj.
+# Keep hidden_dims and n_layers identical so construct/digress runs are directly comparable.
+
+transition: 'marginal'          # DiGress uses marginal; absorbing_edges is ConStruct-specific
+diffusion_steps: 500
+n_layers: 5
+
+# Extra features — same as construct; ConStruct's implementation is a superset of DiGress's
+extra_features: True
+eigenfeatures: True
+max_degree: 10
+num_eigenvectors: 5
+num_eigenvalues: 9
+num_degree: 10
+extra_molecular_features: True  # only activates when dataset_infos.is_molecular=True
+
+# Architecture dimensions — identical to construct.yaml for fair comparison
+hidden_mlp_dims: {'X': 256, 'E': 128, 'y': 128}
+hidden_dims: {'dx': 256, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 128, 'dim_ffy': 128}
+
+# Loss weights: [X (nodes), C (charges), E (edges), y (global)]
+lambda_train: [1, 2, 5, 0]
+
+nu:
+  x: 1
+  c: 1
+  e: 1
+  y: 1
+
+rev_proj: False
+
+dropout: 0.1
+dropout_in_and_out: False
+cycle_features: True

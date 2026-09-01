@@ -1,0 +1,33 @@
+# @package _global_
+# ConStruct-TAGG settings for Community-20 graphs (PDM + TAM)
+general:
+    name: 'construct_comm20_tagg'
+    wandb: 'disabled'
+    check_val_every_n_epochs: 300
+    samples_to_generate: 16
+    samples_to_save: 9
+    chains_to_save: 1
+    final_model_samples_to_generate: 20
+    final_model_samples_to_save: 20
+    final_model_chains_to_save: 10
+
+train:
+    n_epochs: 100000
+    batch_size: 32    # halved from 64 due to PDM overhead
+
+model:
+    diffusion_steps: 500
+    n_layers: 10
+    hidden_mlp_dims: {'X': 128, 'E': 64, 'y': 128}
+    hidden_dims: {'dx': 256, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 64, 'dim_ffy': 256}
+    rev_proj: False
+    use_pdm: True
+    alpha_2: 0.001
+    use_tam: True
+    tam_mu_dim: 1000
+
+dataset:
+    name: comm20
+    datadir: 'data/comm20'
+    adaptive_loader: False
+    fraction: 1.0

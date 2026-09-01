@@ -1,0 +1,1909 @@
+import math
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, List, Optional, Protocol, cast, runtime_checkable
+
+import torch
+import torch.nn as nn
+from tensordict import TensorDict
+from torch.distributions import Categorical, Distribution
+
+from gfn.actions import GraphActions, GraphActionType
+from gfn.constants import DIFFUSION_TERMINAL_TIME_EPS
+from gfn.preprocessors import IdentityPreprocessor, Preprocessor
+from gfn.states import DiscreteStates, States
+from gfn.utils.distributions import (
+    GraphActionDistribution,
+    IsotropicGaussian,
+    UnsqueezedCategorical,
+)
+from gfn.utils.handlers import (
+    has_conditions_exception_handler,
+    no_conditions_exception_handler,
+)
+from gfn.utils.modules import UniformModule
+
+REDUCTION_FUNCTIONS = {
+    "mean": torch.mean,
+    "sum": torch.sum,
+    "prod": torch.prod,
+}
+
+
+class RolloutContext:
+    """Structured per‑rollout state owned by estimators.
+
+    Holds rollout invariants and optional per‑step buffers; use ``extras`` for
+    estimator‑specific fields without changing the class shape.
+    """
+
+    __slots__ = (
+        "batch_size",
+        "device",
+        "conditions",
+        "carry",
+        "trajectory_log_probs",
+        "trajectory_estimator_outputs",
+        "current_estimator_output",
+        "extras",
+    )
+
+    def __init__(
+        self,
+        batch_size: int,
+        device: torch.device,
+        conditions: Optional[torch.Tensor] = None,
+    ) -> None:
+        self.batch_size = batch_size
+        self.device = device
+        self.conditions = conditions
+        self.carry = None
+        self.trajectory_log_probs: List[torch.Tensor] = []
+        self.trajectory_estimator_outputs: List[torch.Tensor] = []
+        self.current_estimator_output: Optional[torch.Tensor] = None
+        self.extras: Dict[str, Any] = {}
+
+
+@runtime_checkable
+class PolicyEstimatorProtocol(Protocol):
+    """Static-typing surface for estimators that are policy-capable.
+
+    This protocol captures the methods provided by the PolicyMixin so that external
+    code (e.g., samplers/probability calculators) can use a precise type rather than
+    relying on dynamic attributes. This helps static analyzers avoid false positives
+    like "Tensor is not callable" when calling mixin methods.
+    """
+
+    is_vectorized: bool
+
+    def init_context(  # noqa: E704
+        self,
+        batch_size: int,
+        device: torch.device,
+        conditions: Optional[torch.Tensor] = None,
+    ) -> Any: ...
+
+    def compute_dist(  # noqa: E704
+        self,
+        states_active: States,
+        ctx: Any,
+        step_mask: Optional[torch.Tensor] = None,
+        **policy_kwargs: Any,
+    ) -> tuple[Distribution, Any]: ...
+
+    def log_probs(  # noqa: E704
+        self,
+        actions_active: torch.Tensor,
+        dist: Distribution,
+        ctx: Any,
+        step_mask: Optional[torch.Tensor] = None,
+        vectorized: bool = False,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, Any]: ...
+
+
+_POLICY_REQUIRED_METHODS = ("init_context", "compute_dist", "log_probs")
+
+
+def validate_policy_estimator(estimator: Any, name: str = "estimator") -> None:
+    """Checks that an estimator implements the PolicyMixin interface.
+
+    Args:
+        estimator: The estimator to validate.
+        name: Label for error messages (e.g., "pf", "pb").
+
+    Raises:
+        TypeError: If a required method is missing.
+    """
+    for method in _POLICY_REQUIRED_METHODS:
+        if not hasattr(estimator, method):
+            raise TypeError(
+                f"Estimator '{name}' is not policy-capable "
+                f"(missing PolicyMixin method: {method})"
+            )
+
+
+class PolicyMixin:
+    """Mixin enabling an `Estimator` to act as a policy (distribution over actions).
+
+    Provides the generic rollout API (`init_context`, `compute_dist`, `log_probs`)
+    directly on the estimator. Standard policies should inherit from this mixin.
+    """
+
+    @property
+    def is_vectorized(self) -> bool:
+        """Used for vectorized probability calculations."""
+        return True
+
+    def init_context(
+        self,
+        batch_size: int,
+        device: torch.device,
+        conditions: Optional[torch.Tensor] = None,
+    ) -> RolloutContext:
+        """Create a new per-rollout context.
+
+        Stores rollout invariants (batch size, device, optional conditions) and
+        initializes empty buffers for per-step artifacts.
+
+        """
+        return RolloutContext(
+            batch_size=batch_size, device=device, conditions=conditions
+        )
+
+    def compute_dist(
+        self,
+        states_active: States,
+        ctx: Any,
+        step_mask: Optional[torch.Tensor] = None,
+        save_estimator_outputs: bool = False,
+        **policy_kwargs: Any,
+    ) -> tuple[Distribution, Any]:
+        """Run the estimator for active rows and build an action Distribution.
+
+        Args:
+            states_active: The states to run the estimator on.
+            ctx: The context to run the estimator on.
+            step_mask: The mask to slice the conditions to the active subset.
+            save_estimator_outputs: Whether to save the estimator outputs.
+            **policy_kwargs: Additional keyword arguments to pass to the estimator.
+
+        Returns:
+            A tuple containing the distribution and the context.
+
+        - Uses `step_mask` to slice conditions to the active subset. When `step_mask`
+          is None, the estimator running in a vectorized context.
+        - Saves the raw estimator output in `ctx.current_estimator_output` for
+          optional recording in `record_step`.
+        """
+        precomputed_estimator_outputs = getattr(ctx, "current_estimator_output", None)
+
+        if step_mask is None and precomputed_estimator_outputs is not None:
+            expected_bs = states_active.batch_shape[0]
+            if precomputed_estimator_outputs.shape[0] != expected_bs:
+                raise RuntimeError(
+                    "current_estimator_output batch size does not match active states. "
+                    f"Got {precomputed_estimator_outputs.shape[0]}, expected {expected_bs}. "
+                    "This indicates stale cache reuse; ensure per-step masking when setting "
+                    "ctx.current_estimator_output and clear it when not valid."
+                )
+            estimator_outputs = precomputed_estimator_outputs
+
+        # Otherwise, compute the estimator outputs.
+        else:
+            cond_active = None
+            if ctx.conditions is not None:
+                if step_mask is None:
+                    cond_active = ctx.conditions
+                else:
+                    cond_active = ctx.conditions[step_mask]
+
+            # Call estimator with or without conditions (ensures preprocessor is applied).
+            if cond_active is not None:
+                with has_conditions_exception_handler("estimator", self):
+                    estimator_outputs = self(states_active, cond_active)  # type: ignore[misc,call-arg]
+            else:
+                with no_conditions_exception_handler("estimator", self):
+                    estimator_outputs = self(states_active)  # type: ignore[misc]
+
+        if callable(policy_kwargs.get("temperature")):
+            policy_kwargs = dict(policy_kwargs)
+            policy_kwargs["temperature"] = policy_kwargs["temperature"](
+                states_active, estimator_outputs
+            )
+
+        # Build the distribution.
+        dist = self.to_probability_distribution(
+            states_active, estimator_outputs, **policy_kwargs
+        )
+
+        # Save current estimator output only when requested.
+        if save_estimator_outputs:
+            ctx.current_estimator_output = estimator_outputs
+
+            # If we are in a non-vectorized path (masked), append a padded copy to trajectory.
+            if step_mask is not None:
+                padded = torch.full(
+                    (ctx.batch_size,) + estimator_outputs.shape[1:],
+                    -float("inf"),
+                    device=ctx.device,
+                )
+                padded[step_mask] = estimator_outputs
+                ctx.trajectory_estimator_outputs.append(padded)
+
+        else:
+            ctx.current_estimator_output = None
+
+        return dist, ctx
+
+    def log_probs(
+        self,
+        actions_active: torch.Tensor,
+        dist: Distribution,
+        ctx: Any,
+        step_mask: Optional[torch.Tensor] = None,
+        vectorized: bool = False,
+        save_logprobs: bool = False,
+    ) -> tuple[torch.Tensor, Any]:
+        """Compute log-probs, optionally padding back to full batch when non-vectorized."""
+        lp = dist.log_prob(actions_active)
+
+        if vectorized:
+            if save_logprobs:
+                ctx.trajectory_log_probs.append(lp)
+            return lp, ctx
+
+        # Non-vectorized path strict check. None of these should be -inf after masking.
+        if getattr(self, "debug", False) and torch.any(torch.isinf(lp)):
+            raise RuntimeError("Log probabilities are inf. This should not happen.")
+
+        assert step_mask is not None, "step_mask is required when vectorized=False"
+        step_lp = torch.full((ctx.batch_size,), 0.0, device=ctx.device, dtype=lp.dtype)
+        step_lp[step_mask] = lp
+
+        if save_logprobs:
+            ctx.trajectory_log_probs.append(step_lp)
+
+        return step_lp, ctx
+
+    def get_current_estimator_output(self, ctx: Any) -> Optional[torch.Tensor]:
+        """Expose the most recent per-step estimator output saved during `compute`."""
+        return getattr(ctx, "current_estimator_output", None)
+
+
+class RecurrentPolicyMixin(PolicyMixin):
+    """Mixin for recurrent policies that maintain and update a rollout carry."""
+
+    @property
+    def is_vectorized(self) -> bool:
+        return False
+
+    def init_context(
+        self,
+        batch_size: int,
+        device: torch.device,
+        conditions: Optional[torch.Tensor] = None,
+    ) -> RolloutContext:
+        ctx = super().init_context(batch_size, device, conditions)
+        init_carry = getattr(self, "init_carry", None)
+        if not callable(init_carry):
+            raise TypeError(
+                "Recurrent policy requires init_carry(batch_size: int, device: torch.device)."
+            )
+        init_carry_fn = cast(Callable[[int, torch.device], Any], init_carry)
+        ctx.carry = init_carry_fn(batch_size, device)
+
+        return ctx
+
+    def compute_dist(
+        self,
+        states_active: States,
+        ctx: Any,
+        step_mask: Optional[torch.Tensor] = None,
+        save_estimator_outputs: bool = False,
+        **policy_kwargs: Any,
+    ) -> tuple[Distribution, Any]:
+        """Run estimator with carry and update it.
+
+        Differs from the default PolicyMixin by calling
+        `estimator(states_active, ctx.carry) -> (est_out, new_carry)`, storing the
+        updated carry and saving `current_estimator_output` before building the
+        Distribution.
+        """
+        estimator_outputs, new_carry = self(states_active, ctx.carry)  # type: ignore
+        ctx.carry = new_carry
+        if callable(policy_kwargs.get("temperature")):
+            policy_kwargs = dict(policy_kwargs)
+            policy_kwargs["temperature"] = policy_kwargs["temperature"](
+                states_active, estimator_outputs
+            )
+
+        dist = self.to_probability_distribution(
+            states_active,
+            estimator_outputs,
+            **policy_kwargs,
+        )
+
+        # Save current estimator output only when requested.
+        if save_estimator_outputs:
+            ctx.current_estimator_output = estimator_outputs
+
+            if step_mask is not None:
+                padded = torch.full(
+                    (ctx.batch_size,) + estimator_outputs.shape[1:],
+                    -float("inf"),
+                    device=ctx.device,
+                )
+                padded[step_mask] = estimator_outputs
+                ctx.trajectory_estimator_outputs.append(padded)
+        else:
+            ctx.current_estimator_output = None
+
+        return dist, ctx
+
+
+class Estimator(ABC, nn.Module):
+    r"""Base class for modules mapping states to distributions or scalar values.
+
+    Training a GFlowNet requires parameterizing one or more of the following functions:
+    - $s \mapsto (\log F(s \rightarrow s'))_{s' \in Children(s)}$
+    - $s \mapsto (P_F(s' \mid s))_{s' \in Children(s)}$
+    - $s' \mapsto (P_B(s \mid s'))_{s \in Parents(s')}$
+    - $s \mapsto (\log F(s))_{s \in States}$
+
+    This class is the base class for all such function estimators. The estimators need
+    to encapsulate a `nn.Module`, which takes a batch of preprocessed states as input
+    and outputs a batch of outputs of the desired shape. When the goal is to represent
+    a probability distribution, the outputs would correspond to the parameters of the
+    distribution, e.g. logits for a categorical distribution for discrete environments.
+
+    The call method is used to output logits, or the parameters to distributions.
+    Otherwise, one can overwrite and use the `to_probability_distribution()` method to
+    directly output a probability distribution.
+
+    The preprocessor is also encapsulated in the estimator.
+    These function estimators implement the `__call__` method, which takes `States`
+    objects as inputs and calls the module on the preprocessed states.
+
+    Attributes:
+        module: The neural network module to use. If it is a Tabular module (from
+            `gfn.utils.modules`), then the environment preprocessor needs to be an
+            `EnumPreprocessor`.
+        preprocessor: Preprocessor object that transforms raw States objects to tensors
+            that can be used as input to the module. Optional, defaults to
+            `IdentityPreprocessor`.
+        is_backward: Flag indicating whether this estimator is for backward policy,
+            i.e., is used for predicting probability distributions over parents.
+    """
+
+    def __init__(
+        self,
+        module: nn.Module,
+        preprocessor: Preprocessor | None = None,
+        is_backward: bool = False,
+        debug: bool = False,
+    ) -> None:
+        """Initializes an Estimator with a neural network module and a preprocessor.
+
+        Args:
+            module: The neural network module to use.
+            preprocessor: Preprocessor object that transforms states to tensors. If None,
+                uses `IdentityPreprocessor` with the module's input_dim.
+            is_backward: Flag indicating whether this estimator is for backward policy,
+                i.e., is used for predicting probability distributions over parents.
+            debug: If True, enables expensive validation checks (NaN/Inf tensor
+                scans, shape assertions) that are useful for debugging but slow
+                down training.
+        """
+        nn.Module.__init__(self)
+        self.debug = debug
+        self.module = module
+        if preprocessor is None:
+            assert hasattr(module, "input_dim") and isinstance(module.input_dim, int), (
+                "Module needs to have an attribute `input_dim` specifying the input "
+                "dimension, in order to use the default IdentityPreprocessor."
+            )
+            preprocessor = IdentityPreprocessor(module.input_dim)
+        self.preprocessor = preprocessor
+        self.is_backward = is_backward
+
+    def forward(self, input: States) -> torch.Tensor:
+        """Forward pass of the module.
+
+        Args:
+            input: The input to the module as states.
+
+        Returns:
+            The output of the module, as a tensor of shape (*batch_shape, output_dim).
+        """
+        preprocessed_input = self.preprocessor(input)
+        out = self.module(preprocessed_input)
+        if self.expected_output_dim is not None:
+            assert out.shape[-1] == self.expected_output_dim, (
+                f"Module output shape {out.shape} does not match expected output "
+                f"dimension {self.expected_output_dim}"
+            )
+        return out
+
+    def __repr__(self):
+        """Returns a string representation of the Estimator.
+
+        Returns:
+            A string summary of the Estimator.
+        """
+        return f"{self.__class__.__name__} module"
+
+    @property
+    @abstractmethod
+    def expected_output_dim(self) -> Optional[int]:
+        """Expected output dimension of the module.
+
+        Returns:
+            The expected output dimension of the module, or None if the output dimension
+            is not well-defined (e.g., when the output is a TensorDict for GraphActions).
+        """
+
+    def to_probability_distribution(
+        self,
+        states: States,
+        module_output: torch.Tensor,
+        **policy_kwargs: Any,
+    ) -> Distribution:
+        """Transforms the output of the module into a probability distribution.
+
+        The kwargs may contain parameters to modify a base distribution, for example to
+        encourage exploration.
+
+        This method is optional for modules that don't need to output probability
+        distributions (e.g., when estimating logF for flow matching). However, it is
+        required for modules that define policies, as it converts raw module outputs into
+        probability distributions over actions. See `DiscretePolicyEstimator` for an
+        example using categorical distributions for discrete actions, or `BoxPFEstimator`
+        for examples using continuous distributions like Beta mixtures.
+
+        Args:
+            states: The states to use.
+            module_output: The output of the module as a tensor of shape
+                (*batch_shape, output_dim).
+            **policy_kwargs: Keyword arguments to modify the distribution.
+
+        Returns:
+            A distribution object.
+        """
+        raise NotImplementedError
+
+
+class ScalarEstimator(Estimator):
+    r"""Class for estimating scalars such as logZ of TB or state/edge flows of DB/SubTB.
+
+    Training a GFlowNet sometimes requires the estimation of precise scalar values,
+    such as the partition function (for TB) or state/edge flows (for DB/SubTB).
+    This Estimator is designed for those cases.
+
+    Attributes:
+        module: The neural network module to use. This doesn't have to directly output a
+            scalar. If it does not, `reduction` will be used to aggregate the outputs of
+            the module into a single scalar.
+        preprocessor: Preprocessor object that transforms raw States objects to tensors
+            that can be used as input to the module.
+        is_backward: Always False for ScalarEstimator (since it's direction-agnostic).
+        reduction_function: Function used to reduce multi-dimensional outputs to scalars.
+    """
+
+    def __init__(
+        self,
+        module: nn.Module,
+        preprocessor: Preprocessor | None = None,
+        reduction: str = "mean",
+        debug: bool = False,
+    ):
+        """Initializes a ScalarEstimator.
+
+        Args:
+            module: The neural network module to use.
+            preprocessor: Preprocessor object that transforms states to tensors. If
+            None, uses `IdentityPreprocessor` with the module's input_dim.
+            reduction: String name of one of the REDUCTION_FUNCTIONS keys.
+            debug: If True, enables expensive validation checks.
+        """
+        super().__init__(module, preprocessor, False, debug=debug)
+        assert (
+            reduction in REDUCTION_FUNCTIONS
+        ), f"reduction function not one of {REDUCTION_FUNCTIONS.keys()}"
+        self.reduction_function = REDUCTION_FUNCTIONS[reduction]
+
+    @property
+    def expected_output_dim(self) -> int:
+        """Expected output dimension of the module.
+
+        Returns:
+            Always 1, as this estimator outputs scalar values.
+        """
+        return 1
+
+    def _calculate_module_output(self, input: States) -> torch.Tensor:
+        return self.module(self.preprocessor(input))
+
+    def forward(self, input: States) -> torch.Tensor:
+        """Forward pass of the module.
+
+        Args:
+            input: The input to the module as states.
+
+        Returns:
+            The output of the module, as a tensor of shape (*batch_shape, 1).
+        """
+        out = self._calculate_module_output(input)
+
+        # Ensures estimator outputs are always scalar.
+        if out.shape[-1] != 1:
+            out = self.reduction_function(out, -1)
+
+        assert out.shape[-1] == 1
+
+        return out
+
+
+class LogitBasedEstimator(Estimator):
+    r"""Base class for estimators that output logits.
+
+    This class is used to define estimators that output logits, which can be used to
+    construct probability distributions.
+
+    Attributes:
+        module: The neural network module to use.
+        preprocessor: Preprocessor object that transforms raw States objects to tensors.
+        is_backward: Flag indicating whether this estimator is for backward policy,
+            i.e., is used for predicting probability distributions over parents.
+    """
+
+    @staticmethod
+    def _prepare_logits(
+        logits: torch.Tensor,
+        masks: torch.Tensor,
+        sf_index: int | None,
+        sf_bias: float,
+        temperature: float | torch.Tensor,
+        debug: bool = False,
+    ) -> torch.Tensor:
+        """Clone and apply mask, bias and temperature to logits."""
+        if isinstance(temperature, torch.Tensor):
+            assert torch.all(temperature > 0.0)
+        else:
+            assert temperature > 0.0
+
+        x = logits.clone()
+        x[~masks] = -float("inf")
+
+        # Ensure at least one finite per row if requested
+        if sf_index is not None:
+            no_valid = masks.sum(dim=-1) == 0
+            if no_valid.any():
+                x[no_valid] = -float("inf")
+                x[no_valid, sf_index] = 0.0  # degenerate one-hot
+        else:
+            # If entire row is masked (e.g., unused component like EDGE_INDEX), place a
+            # harmless finite fallback to avoid all -inf rows through the pipeline, but
+            # only when there is at least one column.
+            if x.shape[-1] > 0:
+                no_valid = masks.sum(dim=-1) == 0
+                if no_valid.any():
+                    x[no_valid] = -float("inf")
+                    # set the first column to 0.0 as a dummy finite value
+                    x[no_valid, 0] = 0.0
+
+        # Assert that each row has at least one finite entry.
+        if debug:
+            assert torch.isfinite(x).any(dim=-1).all(), "All -inf row after masking"
+
+        if sf_index is not None and sf_bias != 0.0:
+            x[..., sf_index] = x[..., sf_index] - sf_bias
+
+        if isinstance(temperature, torch.Tensor):
+            temp = temperature.to(device=x.device, dtype=x.dtype)
+            while temp.ndim < x.ndim:
+                temp = temp.unsqueeze(-1)
+            x = x / temp
+        elif temperature != 1.0:
+            x = x / temperature
+
+        return x
+
+    @staticmethod
+    def _uniform_log_probs(masks: torch.Tensor) -> torch.Tensor:
+        """Uniform log-probs over valid actions; -inf for invalid."""
+        masks_sum = masks.sum(dim=-1, keepdim=True)
+        log_uniform = torch.full_like(
+            masks, fill_value=-float("inf"), dtype=torch.get_default_dtype()
+        )
+        valid_rows = (masks_sum > 0).squeeze(-1)
+        if valid_rows.any():
+            log_uniform[valid_rows] = torch.where(
+                masks[valid_rows],
+                -torch.log(masks_sum[valid_rows].to(torch.get_default_dtype())),
+                torch.full_like(
+                    masks[valid_rows],
+                    fill_value=-float("inf"),
+                    dtype=torch.get_default_dtype(),
+                ),
+            )
+        return log_uniform
+
+    @staticmethod
+    def _mix_with_uniform_in_log_space(
+        lsm: torch.Tensor,
+        masks: torch.Tensor,
+        epsilon: float,
+        debug: bool = False,
+    ) -> torch.Tensor:
+        """Compute log((1-eps) p + eps u) in log space."""
+        if debug:
+            assert 0.0 <= epsilon <= 1.0
+
+        if epsilon == 0.0:
+            return lsm
+
+        log_uniform = LogitBasedEstimator._uniform_log_probs(masks).to(lsm.dtype)
+        eps_tensor = torch.as_tensor(epsilon, dtype=lsm.dtype, device=lsm.device)
+
+        # Row-wise safe mixing: compute only on valid entries; for rows with no valid
+        # actions, keep the original lsm row to avoid all -inf.
+        out = torch.full_like(lsm, -float("inf"))
+        has_any_valid = masks.any(dim=-1)
+
+        if masks.any():
+            mixed_valid_outputs = torch.logaddexp(
+                lsm[masks] + torch.log1p(-eps_tensor),
+                log_uniform[masks] + torch.log(eps_tensor),
+            )
+            out[masks] = mixed_valid_outputs
+
+        # For rows with no valid entries (should only happen for unused components,
+        # e.g., EDGE_INDEX when no edges are able to be added), retain the original
+        # normalized log-probs to avoid all -inf rows.
+        if (~has_any_valid).any():
+            out[~has_any_valid] = lsm[~has_any_valid]
+
+        return out
+
+    @staticmethod
+    def _compute_logits_for_distribution(
+        logits: torch.Tensor,
+        masks: torch.Tensor,
+        sf_index: int | None,
+        sf_bias: float,
+        temperature: float | torch.Tensor,
+        epsilon: float,
+        debug: bool = False,
+    ) -> torch.Tensor:
+        """Return logits to feed a Categorical:
+        - If epsilon == 0: masked, biased, temperature-scaled logits.
+        - Else: normalized log-probs of the epsilon-greedy mixture (valid as logits).
+        """
+        # Check for NaN in module output — the source of NaN from exploding
+        # gradients. Gated behind debug to avoid graph breaks in torch.compile.
+        if debug and torch.isnan(logits).any():
+            raise ValueError(
+                "Module output contains NaN. This typically indicates "
+                "exploding gradients or numerical instability in the model."
+            )
+
+        # Prepare logits first (masking, bias, temperature) in the existing dtype
+        x = LogitBasedEstimator._prepare_logits(
+            logits,
+            masks,
+            sf_index,
+            sf_bias,
+            temperature,
+            debug=debug,
+        )
+
+        if debug:
+            assert not torch.isnan(x).any(), "Prepared logits contain NaNs"
+
+        # Perform numerically sensitive ops in float32 when inputs are low-precision
+        orig_dtype = x.dtype
+        compute_dtype = (
+            torch.float32
+            if orig_dtype in (torch.float16, torch.bfloat16)
+            else orig_dtype
+        )
+
+        if debug:
+            assert torch.isfinite(x).any(dim=-1).all(), "All -inf row before log-softmax"
+
+        lsm = torch.log_softmax(x.to(compute_dtype), dim=-1)
+        if debug:
+            assert (
+                torch.isfinite(lsm).any(dim=-1).all()
+            ), "Invalid log-probs after log_softmax"
+
+        if epsilon == 0.0:
+            return lsm.to(orig_dtype) if lsm.dtype != orig_dtype else lsm
+
+        mixed = LogitBasedEstimator._mix_with_uniform_in_log_space(
+            lsm, masks, epsilon, debug=debug
+        )
+        if debug:
+            assert (
+                torch.isfinite(mixed).any(dim=-1).all()
+            ), "Invalid log-probs after mixing"
+
+        return mixed.to(orig_dtype) if mixed.dtype != orig_dtype else mixed
+
+
+class ConditionalLogZEstimator(ScalarEstimator):
+    """Conditional logZ estimator.
+
+    This estimator is used to estimate the logZ of a GFlowNet from a conditions tensor.
+    Since the conditions are given as a tensor, it does not have a preprocessor.
+    Reduction is used to aggregate the outputs of the module into a single scalar.
+
+    Attributes:
+        module: The neural network module to use.
+        reduction: String name of one of the REDUCTION_FUNCTIONS keys.
+    """
+
+    def __init__(self, module: nn.Module, reduction: str = "mean"):
+        super().__init__(module, preprocessor=None, reduction=reduction)
+
+    def _calculate_module_output(self, input: torch.Tensor) -> torch.Tensor:
+        return self.module(input)
+
+
+class DiscretePolicyEstimator(PolicyMixin, LogitBasedEstimator):
+    r"""Forward or backward policy estimators for discrete environments.
+
+    Estimates either:
+    - $s \mapsto (P_F(s' \mid s))_{s' \in Children(s)}$ (forward policy)
+    - $s' \mapsto (P_B(s \mid s'))_{s \in Parents(s')}$ (backward policy)
+
+    This estimator is designed for discrete environments where actions are represented
+    by integer indices and states have forward/backward masks indicating valid actions.
+
+    Attributes:
+        module: The neural network module to use.
+        n_actions: Total number of actions in the discrete environment.
+        preprocessor: Preprocessor object that transforms raw States objects to tensors.
+        is_backward: Flag indicating whether this estimator is for backward policy,
+            i.e., is used for predicting probability distributions over parents.
+    """
+
+    def __init__(
+        self,
+        module: nn.Module,
+        n_actions: int,
+        preprocessor: Preprocessor | None = None,
+        is_backward: bool = False,
+        debug: bool = False,
+    ):
+        """Initializes a DiscretePolicyEstimator.
+
+        Args:
+            module: The neural network module to use.
+            n_actions: Total number of actions in the discrete environment.
+            preprocessor: Preprocessor object that transforms states to tensors.
+            is_backward: Flag indicating whether this estimator is for backward policy,
+                i.e., is used for predicting probability distributions over parents.
+            debug: If True, enables expensive validation checks.
+        """
+        super().__init__(module, preprocessor, is_backward=is_backward, debug=debug)
+        self.n_actions = n_actions
+
+    @classmethod
+    def uniform(
+        cls,
+        n_actions: int,
+        preprocessor: Preprocessor | None = None,
+    ) -> "DiscretePolicyEstimator":
+        """Create a uniform backward policy estimator for discrete environments.
+
+        Outputs equal logits for all actions, resulting in a uniform distribution
+        over valid parent actions (masking is still applied).
+
+        Args:
+            n_actions: Total number of actions in the discrete environment.
+            preprocessor: Preprocessor object that transforms states to tensors.
+                Required because the input dimension depends on the environment.
+
+        Returns:
+            A ``DiscretePolicyEstimator`` with ``is_backward=True`` and no
+            learnable parameters.
+        """
+        module = UniformModule(output_dim=n_actions - 1, fill_value=0.0)
+        return cls(module, n_actions, preprocessor=preprocessor, is_backward=True)
+
+    @property
+    def expected_output_dim(self) -> int:
+        """Expected output dimension of the module.
+
+        Returns:
+            n_actions for forward policies, n_actions - 1 for backward policies.
+        """
+        if self.is_backward:
+            return self.n_actions - 1
+        else:
+            return self.n_actions
+
+    def to_probability_distribution(
+        self,
+        states: DiscreteStates,
+        module_output: torch.Tensor,
+        sf_bias: float = 0.0,
+        temperature: float | torch.Tensor = 1.0,
+        epsilon: float = 0.0,
+    ) -> Categorical:
+        """Returns a Categorical distribution given a batch of states and module output.
+
+        This implementation stays in logit/log-prob space for numerical stability.
+        When epsilon > 0, we construct the epsilon-greedy distribution by mixing the
+        original distribution with a uniform distribution and pass the resuling
+        normalized log-probs as logits.
+
+        The kwargs may contain parameters to modify a base distribution, for example to
+        encourage exploration.
+
+        Args:
+            states: The discrete states where the policy is evaluated.
+            module_output: The output of the module as a tensor of shape
+                (*batch_shape, output_dim).
+            sf_bias: Scalar to subtract from the exit action logit before dividing by
+                temperature. Does nothing if set to 0.0 (default), in which case it's
+                on policy.
+            temperature: Scalar to divide the logits by before softmax. Does nothing
+                if set to 1.0 (default), in which case it's on policy.
+            epsilon: With probability epsilon, a random action is chosen. Does nothing
+                if set to 0.0 (default), in which case it's on policy.
+
+        Returns:
+            A Categorical distribution over the actions.
+        """
+        if self.debug:
+            assert module_output.shape[-1] == self.expected_output_dim, (
+                f"Module output shape {module_output.shape} does not match "
+                f"expected output dimension {self.expected_output_dim}"
+            )
+            if isinstance(temperature, torch.Tensor):
+                assert torch.all(temperature > 0.0)
+            else:
+                assert temperature > 0.0
+            assert 0.0 <= epsilon <= 1.0
+
+        logits = LogitBasedEstimator._compute_logits_for_distribution(
+            module_output,
+            states.backward_masks if self.is_backward else states.forward_masks,
+            sf_index=-1,
+            sf_bias=sf_bias,
+            temperature=temperature,
+            epsilon=epsilon,
+            debug=self.debug,
+        )
+
+        return UnsqueezedCategorical(logits=logits, debug=self.debug)
+
+
+class ConditionalDiscretePolicyEstimator(DiscretePolicyEstimator):
+    r"""Conditional forward or backward policy estimators for discrete environments.
+
+    Estimates either, with condition $c$:
+    - $s \mapsto (P_F(s' \mid s, c))_{s' \in Children(s)}$ (conditional forward policy)
+    - $s' \mapsto (P_B(s \mid s', c))_{s \in Parents(s')}$ (conditional backward policy)
+
+    This estimator is designed for discrete environments where the policy depends on
+    both the state and some condition information. It uses a multi-module architecture
+    where states and conditions are processed separately before being combined.
+
+    Attributes:
+        module: The neural network module for state processing.
+        condition_module: The neural network module for condition processing.
+        final_module: The neural network module that combines state and condition.
+        n_actions: Total number of actions in the discrete environment.
+        preprocessor: Preprocessor object that transforms raw States objects to tensors.
+        is_backward: Flag indicating whether this estimator is for backward policy,
+            i.e., is used for predicting probability distributions over parents.
+    """
+
+    def __init__(
+        self,
+        state_module: nn.Module,
+        condition_module: nn.Module,
+        final_module: nn.Module,
+        n_actions: int,
+        preprocessor: Preprocessor | None = None,
+        is_backward: bool = False,
+        debug: bool = False,
+    ):
+        """Initializes a ConditionalDiscretePolicyEstimator.
+
+        Args:
+            state_module: The neural network module for state processing.
+            condition_module: The neural network module for condition processing.
+            final_module: The neural network module that combines state and condition.
+            n_actions: Total number of actions in the discrete environment.
+            preprocessor: Preprocessor object that transforms states to tensors.
+            is_backward: Flag indicating whether this estimator is for backward policy,
+                i.e., is used for predicting probability distributions over parents.
+            debug: If True, enables expensive validation checks.
+        """
+        super().__init__(state_module, n_actions, preprocessor, is_backward, debug=debug)
+        self.n_actions = n_actions
+        self.condition_module = condition_module
+        self.final_module = final_module
+
+    def _forward_trunk(self, states: States, conditions: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the trunk of the module.
+
+        This method processes the states and conditions inputs separately, then
+        combines them through the final module.
+
+        Args:
+            states: The input states.
+            conditions: The condition tensor.
+
+        Returns:
+            The output of the trunk of the module, as a tensor of shape
+                (*batch_shape, output_dim).
+        """
+        state_out = self.module(self.preprocessor(states))
+        condition_out = self.condition_module(conditions)
+        out = self.final_module(torch.cat((state_out, condition_out), -1))
+
+        return out
+
+    def forward(self, states: States, conditions: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the module.
+
+        Args:
+            states: The input states.
+            conditions: The condition tensor.
+
+        Returns:
+            The output of the module, as a tensor of shape (*batch_shape, output_dim).
+        """
+        out = self._forward_trunk(states, conditions)
+        assert out.shape[-1] == self.expected_output_dim, (
+            f"Module output shape {out.shape} does not match expected output "
+            f"dimension {self.expected_output_dim}"
+        )
+        return out
+
+
+class ConditionalScalarEstimator(ConditionalDiscretePolicyEstimator):
+    r"""Class for conditionally estimating scalars (logZ, DB/SubTB state logF).
+
+    Similar to `ScalarEstimator`, the function approximator used for `final_module` need
+    not directly output a scalar. If it does not, `reduction` will be used to aggregate
+    the outputs of the module into a single scalar.
+
+    Attributes:
+        module: The neural network module for state processing.
+        condition_module: The neural network module for condition processing.
+        final_module: The neural network module that combines state and condition.
+        preprocessor: Preprocessor object that transforms raw States objects to tensors.
+        is_backward: Always False for ConditionalScalarEstimator (since it's
+            direction-agnostic).
+        reduction_function: Function used to reduce multi-dimensional outputs to scalars.
+    """
+
+    def __init__(
+        self,
+        state_module: nn.Module,
+        condition_module: nn.Module,
+        final_module: nn.Module,
+        preprocessor: Preprocessor | None = None,
+        reduction: str = "mean",
+        debug: bool = False,
+    ):
+        """Initializes a ConditionalScalarEstimator.
+
+        Args:
+            state_module: The neural network module for state processing.
+            condition_module: The neural network module for condition processing.
+            final_module: The neural network module that combines state and condition.
+            preprocessor: Preprocessor object that transforms states to tensors.
+            reduction: String name of one of the REDUCTION_FUNCTIONS keys.
+            debug: If True, enables expensive validation checks.
+        """
+
+        super().__init__(
+            state_module,
+            condition_module,
+            final_module,
+            n_actions=1,
+            preprocessor=preprocessor,
+            is_backward=False,
+            debug=debug,
+        )
+        assert (
+            reduction in REDUCTION_FUNCTIONS
+        ), f"reduction function not one of {set(REDUCTION_FUNCTIONS)}"
+        self.reduction_function = REDUCTION_FUNCTIONS[reduction]
+
+    def forward(self, states: States, conditions: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the module.
+
+        Args:
+            states: The input states.
+            conditions: The condition tensor.
+
+        Returns:
+            The output of the module, as a tensor of shape (*batch_shape, 1).
+        """
+        out = self._forward_trunk(states, conditions)
+
+        # Ensures estimator outputs are always scalar.
+        if out.shape[-1] != 1:
+            out = self.reduction_function(out, -1)
+
+        assert out.shape[-1] == self.expected_output_dim, (
+            f"Module output shape {out.shape} does not match expected output "
+            f"dimension {self.expected_output_dim}"
+        )
+        return out
+
+    @property
+    def expected_output_dim(self) -> int:
+        """Expected output dimension of the module.
+
+        Returns:
+            Always 1, as this estimator outputs scalar values.
+        """
+        return 1
+
+    def to_probability_distribution(
+        self,
+        states: States,
+        module_output: torch.Tensor,
+        **policy_kwargs: Any,
+    ) -> Distribution:
+        """Transforms the output of the module into a probability distribution.
+
+        This method should not be called for ConditionalScalarEstimator as it outputs
+        scalar values, not probability distributions.
+
+        Raises:
+            NotImplementedError: This method is not implemented for scalar estimators.
+        """
+        raise NotImplementedError
+
+
+class DiscreteGraphPolicyEstimator(PolicyMixin, LogitBasedEstimator):
+    r"""Forward or backward policy estimators for graph-based environments.
+
+    Estimates either, where $s$ and $s'$ are graph states:
+    - $s \mapsto (P_F(s' \mid s))_{s' \in Children(s)}$ (forward policy)
+    - $s' \mapsto (P_B(s \mid s'))_{s \in Parents(s')}$ (backward policy)
+
+    This estimator is designed for graph-based environments where actions modify graphs
+    and states are represented as graphs. The output is a TensorDict containing logits
+    for different action components (action type, node class, edge class, edge index).
+
+    Attributes:
+        module: The neural network module to use.
+        preprocessor: Preprocessor object that transforms GraphStates objects to tensors.
+        is_backward: Flag indicating whether this estimator is for backward policy,
+            i.e., is used for predicting probability distributions over parents.
+    """
+
+    def to_probability_distribution(
+        self,
+        states: States,
+        module_output: TensorDict,
+        sf_bias: float = 0.0,
+        temperature: dict[str, float] = defaultdict(lambda: 1.0),
+        epsilon: dict[str, float] = defaultdict(lambda: 0.0),
+    ) -> Distribution:
+        """Returns a probability distribution given a batch of states and module output.
+
+        Similar to `DiscretePolicyEstimator.to_probability_distribution()`, but handles
+        the complex structure of graph actions through a TensorDict. The method applies
+        masks, biases, temperature scaling, and epsilon-greedy exploration to each
+        action component separately.
+
+        Args:
+            states: The graph states where the policy is evaluated.
+            module_output: The output of the module as a TensorDict containing logits
+                for different action components.
+            sf_bias: Scalar to subtract from the exit action logit before dividing by
+                temperature.
+            temperature: Dictionary mapping action component keys to temperature values
+                for scaling logits.
+            epsilon: Dictionary mapping action component keys to epsilon values for
+                exploration.
+
+        Returns:
+            A GraphActionDistribution over the graph actions.
+        """
+        masks = states.backward_masks if self.is_backward else states.forward_masks
+        Ga = GraphActions  # Shorthand for GraphActions.
+        GaType = GraphActionType  # Shorthand for GraphActionType.
+
+        logits = module_output
+        logits[Ga.ACTION_TYPE_KEY][~masks[Ga.ACTION_TYPE_KEY]] = -float("inf")
+        logits[Ga.NODE_CLASS_KEY][~masks[Ga.NODE_CLASS_KEY]] = -float("inf")
+        logits[Ga.NODE_INDEX_KEY][~masks[Ga.NODE_INDEX_KEY]] = -float("inf")
+        logits[Ga.EDGE_CLASS_KEY][~masks[Ga.EDGE_CLASS_KEY]] = -float("inf")
+        logits[Ga.EDGE_INDEX_KEY][~masks[Ga.EDGE_INDEX_KEY]] = -float("inf")
+
+        # The following operations are to ensure that the logits are valid, i.e.,
+        # contain at least one finite entry.
+
+        # Check if no possible edge can be added,
+        # and assert that action type cannot be ADD_EDGE
+        no_possible_edge_index = torch.isneginf(logits[Ga.EDGE_INDEX_KEY]).all(-1)
+        if self.debug:
+            assert torch.isneginf(
+                logits[Ga.ACTION_TYPE_KEY][no_possible_edge_index, GaType.ADD_EDGE]
+            ).all()
+        logits[Ga.EDGE_INDEX_KEY][no_possible_edge_index] = 0.0
+
+        # Check if no possible edge class can be added,
+        # and assert that action type cannot be ADD_EDGE
+        no_possible_edge_class = torch.isneginf(logits[Ga.EDGE_CLASS_KEY]).all(-1)
+        if self.debug:
+            assert torch.isneginf(
+                logits[Ga.ACTION_TYPE_KEY][no_possible_edge_class, GaType.ADD_EDGE]
+            ).all()
+        logits[Ga.EDGE_CLASS_KEY][no_possible_edge_class] = 0.0
+
+        # Check if no possible node can be added; if either class OR index has no
+        # valid options, disallow ADD_NODE in action type and set harmless finite
+        # fallbacks for the unused components.
+        no_possible_node_class = torch.isneginf(logits[Ga.NODE_CLASS_KEY]).all(-1)
+        no_possible_node_index = torch.isneginf(logits[Ga.NODE_INDEX_KEY]).all(-1)
+
+        # If backward, we only need to check if the node index is possible to remove.
+        # If forward, we only need to check if the node class is possible to add.
+        no_possible_add_node = (
+            no_possible_node_index if self.is_backward else no_possible_node_class
+        )
+        logits[Ga.ACTION_TYPE_KEY][no_possible_add_node, GaType.ADD_NODE] = -float("inf")
+        logits[Ga.NODE_CLASS_KEY][no_possible_node_class] = 0.0
+        logits[Ga.NODE_INDEX_KEY][no_possible_node_index] = 0.0
+
+        transformed_logits = {}
+        for key in logits.keys():
+            if self.debug:
+                assert isinstance(key, str)
+                assert not torch.isnan(logits[key]).any(), f"logits[{key}] contains NaNs"
+
+            # Pad zero-length components to length 1 with an invalid mask so downstream
+            # operations have at least one column and distributions can be constructed.
+            local_logits = logits[key]
+            local_masks = masks[key]
+            if local_logits.shape[-1] == 0:
+                local_logits = torch.zeros(
+                    *local_logits.shape[:-1],
+                    1,
+                    dtype=local_logits.dtype,
+                    device=local_logits.device,
+                )
+                local_masks = torch.zeros(
+                    *local_masks.shape[:-1],
+                    1,
+                    dtype=torch.bool,
+                    device=local_masks.device,
+                )
+
+            # Logit transformations allow for off-policy exploration.
+            transformed_logits[key] = (
+                LogitBasedEstimator._compute_logits_for_distribution(
+                    logits=local_logits,
+                    masks=local_masks,
+                    # ACTION_TYPE_KEY contains the exit action logit.
+                    sf_index=GaType.EXIT if key == Ga.ACTION_TYPE_KEY else None,
+                    sf_bias=sf_bias if key == Ga.ACTION_TYPE_KEY else 0.0,
+                    temperature=temperature[
+                        key
+                    ],  # pyright: ignore[reportArgumentType, reportIndexIssue]
+                    epsilon=epsilon[
+                        key
+                    ],  # pyright: ignore[reportArgumentType, reportIndexIssue]
+                    debug=self.debug,
+                )
+            )
+
+        return GraphActionDistribution(
+            logits=TensorDict(transformed_logits),
+            is_backward=self.is_backward,
+            debug=self.debug,
+        )
+
+    @property
+    def expected_output_dim(self) -> Optional[int]:
+        """Expected output dimension of the module.
+
+        Returns:
+            None, as the output_dim of a TensorDict is not well-defined.
+        """
+        return None
+
+
+# Cursor the recurrent estimator attaches to carries whose module does not track one
+# itself, so the cached path can tell how much of the token stream a carry has seen.
+_CACHE_CURSOR_KEY = "_gfn_cache_cursor"
+
+
+class RecurrentDiscretePolicyEstimator(RecurrentPolicyMixin, DiscretePolicyEstimator):
+    """Discrete policy estimator for recurrent architectures with explicit carry.
+
+    Many sequence models (e.g., RNN/LSTM/GRU/Transformer in autoregressive mode)
+    maintain a recurrent hidden state ("carry") that must be threaded through
+    successive calls during sampling. This class formalizes that pattern for
+    GFlowNet policies by:
+
+    - Exposing a forward signature ``forward(states, carry) -> (logits, carry)``
+      so the policy can update and return the next carry at each step.
+    - Requiring an ``init_carry(batch_size, device)`` method to allocate the
+      initial hidden state for a rollout.
+    - Ensuring the per-step output (``logits`` over actions) is derived from the
+      latest token/time step while the internal model may process sequences.
+
+    The sampler uses a ``RecurrentPolicyMixin`` which calls this estimator
+    with the current carry, updates the carry on every step, and records
+    per-step artifacts. Non-recurrent estimators should use the default PolicyMixin
+    and the standard ``DiscretePolicyEstimator`` base class instead.
+
+    Two optional, fixed-length-only performance modes (both opt-in; defaults leave
+    behavior unchanged):
+
+    - ``use_kv_cache=True`` decodes one token per step against a persistent, in-place
+      preallocated KV-cache, cutting rollout cost from O(L^3) to O(L^2). The in-place
+      buffers cannot carry gradients, so cached sampling runs under ``no_grad`` -- it is
+      a sampling-time optimization, ideal for inference/rollout.
+    - ``teacher_forced_loss=True`` recomputes PF log-probs in the loss with a single
+      parallel forward per trajectory (grad-bearing). Left unset it defaults to
+      ``use_kv_cache``, so a cached policy is trainable out of the box via
+      ``loss(..., recalculate_all_logprobs=True)``; an explicit value always wins.
+
+    These are performance modes, not correctness modes: a cached policy trains
+    correctly either way. The per-step recompute temporarily restores the full-prefix
+    forward (see ``grad_bearing_forward``), so it is slower than teacher forcing but
+    never silently gradient-free.
+
+    Notes
+    -----
+    - ``init_carry`` is a hard requirement for compatibility with the recurrent
+      PolicyMixin.
+    - Both performance modes assume fixed-length trajectories; see the Gap-2 TODO in
+      ``gfn/utils/prob_calculations.py``.
+
+    Attributes:
+        module: The neural network module to use.
+        n_actions: Total number of actions in the discrete environment.
+        preprocessor: Preprocessor object that transforms states to tensors.
+        is_backward: Flag indicating whether this estimator is for backward policy,
+            i.e., is used for predicting probability distributions over parents.
+    """
+
+    def __init__(
+        self,
+        module: nn.Module,
+        n_actions: int,
+        preprocessor: Preprocessor | None = None,
+        is_backward: bool = False,
+        debug: bool = False,
+        use_kv_cache: bool = False,
+        cache_max_len: int | None = None,
+        teacher_forced_loss: bool | None = None,
+    ):
+        """Initializes a RecurrentDiscretePolicyEstimator.
+
+        See the class docstring for what the two performance modes do and why cached
+        sampling is ``no_grad``.
+
+        Args:
+            module: The neural network module to use.
+            n_actions: Total number of actions in the discrete environment.
+            preprocessor: Preprocessor object that transforms states to tensors.
+            is_backward: Flag indicating whether this estimator is for backward policy.
+            debug: If True, enables expensive validation checks.
+            use_kv_cache: Opt into the O(L^2) in-place KV-cache sampling fast path.
+                Sampling then runs under ``no_grad``, so ``teacher_forced_loss``
+                defaults to True to keep the policy trainable efficiently. If False
+                (default), sampling uses the corrected grad-bearing full-prefix
+                forward each step. Not supported for backward policies.
+            cache_max_len: KV-cache preallocation length; defaults to the module's
+                ``max_position_embeddings``. Rarely set by hand. It must be at least
+                the env horizon + 1 (the +1 is the BOS token); that lower bound
+                depends on the env and so cannot be checked here -- an undersized
+                value raises from the module partway through the rollout. Only the
+                upper bound (``max_position_embeddings``) is validated eagerly.
+                Note the default is sized for the *model*, not the env: with a large
+                ``max_position_embeddings`` and a short horizon the preallocated K/V
+                buffers can be far bigger than a rollout needs (they scale as
+                ``batch * layers * heads * cache_max_len * head_dim``), so set this to
+                the env horizon + 1 when memory matters.
+            teacher_forced_loss: Recompute PF log-probs in the loss with one parallel
+                forward per trajectory instead of the per-step loop. Fixed-length
+                trajectories only. Left unset (``None``, the default) it follows
+                ``use_kv_cache``; pass an explicit bool to override that in either
+                direction. Explicit ``False`` alongside ``use_kv_cache=True`` is
+                supported and still trains correctly -- the per-step recompute
+                transparently falls back to the grad-bearing full-prefix forward --
+                it is simply slower.
+        """
+        if preprocessor is None:
+            preprocessor = IdentityPreprocessor(output_dim=None)
+
+        super().__init__(
+            module=module,
+            n_actions=n_actions,
+            preprocessor=preprocessor,
+            is_backward=is_backward,
+            debug=debug,
+        )
+        # The cache assumes a monotonically growing committed prefix, so its write
+        # cursor advances in lockstep with the sequence length. A backward policy walks
+        # the trajectory in reverse -- the committed length *shrinks* while the cursor
+        # would still grow -- so every step after the first would attend to a stale
+        # prefix. Reject the combination rather than decode silently wrong logits.
+        if use_kv_cache and is_backward:
+            raise ValueError(
+                "use_kv_cache=True is not supported for backward policies "
+                "(is_backward=True): the cache assumes a growing committed prefix, "
+                "while backward rollouts shrink it. Use use_kv_cache=False for PB."
+            )
+        self.use_kv_cache = use_kv_cache
+        # A preallocated in-place cache is only available for modules that expose a
+        # bounded position range (e.g. TransformerDiscreteSequenceModel). Modules
+        # without one (e.g. RNNs, whose carry is already fixed-size) decode one token
+        # per step with their ordinary carry.
+        max_positions = getattr(module, "max_position_embeddings", None)
+        if cache_max_len is not None and max_positions is None:
+            # Such a module (e.g. an RNN, whose carry is already fixed-size) has no
+            # init_carry(max_len=...) to receive this, so honouring it would surface
+            # later as an opaque TypeError from init_carry.
+            raise ValueError(
+                f"cache_max_len={cache_max_len} was given, but "
+                f"{type(module).__name__} does not expose max_position_embeddings and "
+                "so has no preallocated cache to size. Omit cache_max_len; the module "
+                "decodes one token per step against its own fixed-size carry."
+            )
+        if cache_max_len is None:
+            cache_max_len = max_positions
+        # Only the upper bound is knowable here: the lower bound is the env horizon,
+        # which the estimator never sees. An undersized cache raises an actionable
+        # "preallocated carry is too short" from the module during the rollout.
+        if (
+            cache_max_len is not None
+            and max_positions is not None
+            and cache_max_len > max_positions
+        ):
+            raise ValueError(
+                f"cache_max_len ({cache_max_len}) exceeds the module's "
+                f"max_position_embeddings ({max_positions})."
+            )
+        self._cache_max_len = cache_max_len
+        # Cached sampling is no_grad, so training needs a grad-bearing loss recompute.
+        # Default (None) follows use_kv_cache so a cached policy trains efficiently out
+        # of the box; an explicit bool is always honoured.
+        self.teacher_forced_loss = (
+            use_kv_cache if teacher_forced_loss is None else teacher_forced_loss
+        )
+
+    @property
+    def _bos_index(self) -> int:
+        """BOS token index (the sequence model reserves ``vocab_size`` for BOS)."""
+        return int(getattr(self.module, "vocab_size", self.n_actions - 1))
+
+    def forward(
+        self,
+        states: States,
+        carry: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Per-step forward: next-action logits for the current rollout states.
+
+        Both paths build the same canonical token stream ``[BOS, w_0, ..., w_{t-1}]``
+        and take the logits at the last position, so they are numerically equivalent
+        to one teacher-forced forward over the full sequence -- in eval mode. Under
+        ``model.train()`` with ``dropout > 0`` they legitimately diverge: the cache
+        freezes K/V computed under one dropout mask, while the full-prefix path
+        redraws a mask every step. That is inherent to KV caching, not a defect, but
+        it means the equivalence claim below is an eval-mode claim.
+
+
+        - ``use_kv_cache=False`` (default): re-embed the whole committed prefix with a
+          fresh carry each step (grad-bearing, O(L^3) over a rollout). This is the
+          corrected baseline.
+        - ``use_kv_cache=True``: feed only the newest committed token against the
+          persistent carry (in-place KV-cache for transformers), under ``no_grad``.
+
+        Args:
+            states: The current (active) rollout states, ``(B, W)`` word indices with
+                ``-1`` padding.
+            carry: The recurrent carry threaded from the previous step.
+
+        Returns:
+            ``(logits (B, n_actions), updated carry)``.
+        """
+        tokens = states.tensor.long()
+        if tokens.dim() != 2:
+            raise ValueError(
+                "RecurrentDiscretePolicyEstimator expects 2D state tensors "
+                f"(batch, seq); got shape {tuple(tokens.shape)}."
+            )
+        lengths = (states.tensor >= 0).sum(dim=-1)  # committed words per row
+
+        if self.use_kv_cache:
+            logits, carry = self._forward_cached(tokens, lengths, carry)
+        else:
+            logits, carry = self._forward_full_prefix(tokens, lengths)
+
+        logits = logits[:, -1, :]  # (B, n_actions)
+
+        if self.expected_output_dim is not None:
+            assert logits.shape[-1] == self.expected_output_dim, (
+                f"Module output shape {logits.shape} does not match expected output "
+                f"dimension {self.expected_output_dim}"
+            )
+
+        return logits, carry
+
+    def _canonical_sequence(
+        self,
+        tokens: torch.Tensor,
+        lengths: torch.Tensor,
+        max_len: int | None = None,
+    ) -> torch.Tensor:
+        """Build ``[BOS, w_0, ..., w_{L-1}]`` up to the longest committed length ``L``.
+
+        Used by the (no-cache) full-prefix path and the teacher-forced loss recompute.
+
+        Args:
+            tokens: ``(B, W)`` word indices, ``-1`` padded.
+            lengths: ``(B,)`` committed words per row.
+            max_len: ``L``, if the caller already knows it. Passing it avoids a
+                host sync on ``lengths.max()``, which matters on the cached hot path.
+        """
+        bos = self._bos_index
+        if max_len is None:
+            max_len = int(lengths.max().item())
+        # Replace any -1 padding with BOS; unlike the cached path this one has no
+        # fixed-length guard, so shorter rows can carry padding inside [:max_len].
+        words = torch.where(tokens < 0, torch.full_like(tokens, bos), tokens)[
+            :, :max_len
+        ]
+        bos_col = torch.full(
+            (tokens.shape[0], 1), bos, dtype=torch.long, device=tokens.device
+        )
+        return torch.cat([bos_col, words], dim=1)  # (B, L + 1)
+
+    def _forward_full_prefix(
+        self,
+        tokens: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Grad-bearing baseline: full prefix + fresh carry each step."""
+        seq = self._canonical_sequence(tokens, lengths)
+        fresh = self._module_init_carry(seq.shape[0], seq.device, preallocate=False)
+        logits, new_carry = self.module(seq, fresh)
+        return logits, new_carry
+
+    def _forward_cached(
+        self,
+        tokens: torch.Tensor,
+        lengths: torch.Tensor,
+        carry: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Cached fast path: feed only the newest committed token, under ``no_grad``.
+
+        Assumes fixed-length rollouts (all active rows share a committed length). That
+        assumption is checked unconditionally: a ragged active batch would decode the
+        wrong column for every row and produce silently wrong logits, which is far more
+        costly than the check. It is also nearly free -- the path already has to read
+        the committed length back to the host, so validating it folds into the same
+        device sync (min and max are read together).
+
+        The cursor-sync check is gated behind ``debug``, since it only catches a caller
+        that mutated the carry between steps.
+        """
+        if lengths.numel() > 0:
+            # One host sync for both bounds, rather than one per `.item()` call.
+            lo, hi = torch.stack([lengths.min(), lengths.max()]).tolist()
+            if lo != hi:
+                raise ValueError(
+                    "use_kv_cache=True requires equal-length active trajectories "
+                    f"(fixed-length env); got committed lengths spanning [{lo}, {hi}]. "
+                    "Variable-length carry slicing is out of scope (see the Gap-2 TODO "
+                    "in gfn/utils/prob_calculations.py)."
+                )
+            length0 = int(hi)
+        else:
+            length0 = 0
+
+        if self.is_backward:
+            # Also checked at construction; re-checked here because use_kv_cache is a
+            # mutable public attribute (grad_bearing_forward toggles it), so the
+            # constructor guard alone can be bypassed by assignment.
+            raise ValueError(
+                "use_kv_cache=True is not supported for backward policies: the cache "
+                "assumes a growing committed prefix, while backward rollouts shrink it."
+            )
+
+        consumed = self._cache_cursor(carry)
+        if consumed > length0:
+            # The carry has consumed more of the stream than the states have committed,
+            # so it belongs to a different (longer) rollout. Nothing sensible to decode.
+            raise ValueError(
+                f"KV-cache cursor ({consumed}) is ahead of the committed length "
+                f"({length0}); the carry must be threaded unmodified across steps and "
+                "must correspond to these states. Re-initialize it with init_carry()."
+            )
+
+        # Feed whatever part of the canonical stream [BOS, w_0, ..., w_{length0-1}] the
+        # carry has not consumed yet. In steady state (cursor == length0) that is the
+        # single newest token, which is the fast path this optimization exists for.
+        #
+        # It is more than one token whenever a rollout does not start at s0 -- e.g.
+        # Sampler.sample_trajectories(states=...), which LocalSearchSampler uses to
+        # resume from a junction state. There the carry starts empty while the states
+        # already carry a prefix, so the cache must be primed with that whole prefix
+        # first. Decoding only the newest token there would attend against an empty
+        # cache and silently shift every absolute position.
+        seq = self._canonical_sequence(tokens, lengths, max_len=length0)
+        step_tok = seq[:, consumed:]
+
+        with torch.no_grad():
+            logits, new_carry = self.module(step_tok, carry)
+        # The module rebuilds the carry from its own keys, so re-attach our cursor.
+        new_carry[_CACHE_CURSOR_KEY] = torch.tensor(
+            consumed + step_tok.shape[1], dtype=torch.long, device=tokens.device
+        )
+        return logits, new_carry
+
+    def _cache_cursor(self, carry: dict[str, torch.Tensor]) -> int:
+        """How many tokens of the canonical stream this carry has already consumed.
+
+        A preallocated transformer carry tracks this itself as ``cache_len``. Carries
+        that do not (RNN/LSTM/GRU, whose hidden state is fixed-size) get the same
+        bookkeeping attached by this estimator, so both kinds can tell a primed carry
+        from a fresh one. A carry with neither marker is treated as fresh.
+        """
+        for key in ("cache_len", _CACHE_CURSOR_KEY):
+            if key in carry:
+                return int(carry[key].item())
+        return 0
+
+    def _module_init_carry(
+        self, batch_size: int, device: torch.device, preallocate: bool
+    ) -> dict[str, torch.Tensor]:
+        init_carry = getattr(self.module, "init_carry", None)
+        if not callable(init_carry):
+            raise NotImplementedError(
+                "Module does not implement init_carry(batch_size, device)."
+            )
+        init_carry_fn = cast(Callable[..., dict[str, torch.Tensor]], init_carry)
+        if preallocate and self._cache_max_len is not None:
+            return init_carry_fn(batch_size, device, max_len=self._cache_max_len)
+        return init_carry_fn(batch_size, device)
+
+    def init_carry(
+        self,
+        batch_size: int,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        # Preallocate an in-place cache only for the cached fast path.
+        return self._module_init_carry(batch_size, device, preallocate=self.use_kv_cache)
+
+    @contextmanager
+    def grad_bearing_forward(self):
+        """Temporarily force the grad-bearing full-prefix path.
+
+        The cached fast path runs under ``no_grad`` (its in-place K/V buffers cannot
+        carry gradients), which is correct for sampling but silently produces zero
+        gradients if the same estimator is re-run to recompute log-probs inside a loss.
+        Loss-time recomputation therefore enters this context, which restores the
+        ordinary full-prefix forward -- and, because ``init_carry`` keys off the same
+        flag, the non-preallocated (grad-safe) carry that goes with it.
+
+        Sampling never uses this; it is a loss-time escape hatch. Not thread-safe: it
+        toggles state on the estimator for the duration of the block.
+        """
+        previous = self.use_kv_cache
+        self.use_kv_cache = False
+        try:
+            yield
+        finally:
+            self.use_kv_cache = previous
+
+
+class DiffusionPolicyEstimator(PolicyMixin, Estimator):
+    """Base class for diffusion policy estimators."""
+
+    def __init__(
+        self,
+        s_dim: int,
+        module: nn.Module,
+        is_backward: bool = False,
+        debug: bool = False,
+    ):
+        """Initialize the DiffusionPolicyEstimator.
+
+        Args:
+            s_dim: The dimension of the states.
+            module: The neural network module to use.
+            is_backward: Flag indicating whether this estimator is for backward policy,
+                i.e., is used for predicting probability distributions over parents.
+            debug: If True, enables expensive validation checks.
+        """
+        self.s_dim = s_dim
+        super().__init__(
+            module=module,
+            preprocessor=None,  # Use the IdentityPreprocessor
+            is_backward=is_backward,
+            debug=debug,
+        )
+
+    @property
+    def expected_output_dim(self) -> int:
+        return self.s_dim
+
+    @abstractmethod
+    def forward(self, input: States) -> torch.Tensor:
+        """Forward pass of the module.
+
+        Args:
+            input: The input to the module as states.
+
+        Returns:
+            The output of the module, as a tensor of shape (*batch_shape, output_dim).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def to_probability_distribution(
+        self,
+        states: States,
+        module_output: torch.Tensor,
+        **policy_kwargs: Any,
+    ) -> IsotropicGaussian:
+        """Transform the output of the module into a IsotropicGaussian distribution.
+
+        Args:
+            states: The states to use, states.tensor.shape = (*batch_shape, s_dim + 1).
+            module_output: The output of the module (actions), as a tensor of shape
+                (*batch_shape, s_dim).
+            **policy_kwargs: Keyword arguments to modify the distribution.
+
+        Returns:
+            A IsotropicGaussian distribution.
+        """
+        raise NotImplementedError
+
+
+class PinnedBrownianMotionForward(DiffusionPolicyEstimator):  # TODO: support OU process
+    def __init__(
+        self,
+        s_dim: int,
+        pf_module: nn.Module,
+        sigma: float,
+        num_discretization_steps: int,
+        n_variance_outputs: int = 0,
+    ):
+        """Initialize the PinnedBrownianMotionForward.
+
+        Args:
+            s_dim: The dimension of the states.
+            pf_module: The neural network module to use for the forward policy.
+            sigma: The diffusion coefficient parameter for the pinned Brownian motion.
+            num_discretization_steps: The number of discretization steps.
+        """
+        super().__init__(s_dim=s_dim, module=pf_module, is_backward=False)
+
+        # Pinned Brownian Motion related
+        self.sigma = sigma
+        self.num_discretization_steps = num_discretization_steps
+        self.dt = 1.0 / self.num_discretization_steps
+        self.n_variance_outputs = n_variance_outputs
+
+    @property
+    def expected_output_dim(self) -> int:
+        # Drift (s_dim) plus optional variance outputs.
+        return self.s_dim + self.n_variance_outputs
+
+    def forward(self, input: States) -> torch.Tensor:
+        """Forward pass of the module.
+
+        Args:
+            input: The input to the module as states.
+
+        Returns:
+            The output of the module, as a tensor of shape (*batch_shape, output_dim).
+        """
+        out = self.module(self.preprocessor(input))
+
+        if self.expected_output_dim is not None:
+            assert out.shape[-1] == self.expected_output_dim, (
+                f"Module output shape {out.shape} does not match expected output "
+                f"dimension {self.expected_output_dim}"
+            )
+        return out
+
+    def to_probability_distribution(
+        self,
+        states: States,
+        module_output: torch.Tensor,
+        **policy_kwargs: Any,
+    ) -> IsotropicGaussian:
+        """Transform the output of the module into a IsotropicGaussian distribution,
+        which is the distribution of the next states under the pinned Brownian motion
+        controlled by the output of the module.
+
+        Args:
+            states: The states to use, states.tensor.shape = (*batch_shape, s_dim + 1).
+            module_output: The output of the module (actions), as a tensor of shape
+                (*batch_shape, s_dim).
+            **policy_kwargs: Keyword arguments to modify the distribution. Supported
+                keys:
+                - exploration_std: Optional float or Tensor controlling extra
+                  exploration noise on top of the base diffusion std. When
+                  provided, the extra noise is combined in variance-space
+                  (logaddexp) with the base diffusion variance; non-positive
+                  values are ignored.
+
+        Returns:
+            A IsotropicGaussian distribution (distribution of the next states)
+        """
+        assert len(states.batch_shape) == 1, "States must have a batch_shape of length 1"
+        # s_curr is not needed; drift comes entirely from module_output.
+        t_curr = states.tensor[:, [-1]]
+
+        # Check if the NEXT step would reach terminal time, not if we're already there.
+        # This matches the exit condition in DiffusionSampling.step() and ensures the
+        # sampled action is marked as an exit action (-inf) so trajectory masks align
+        # correctly in get_trajectory_pbs.
+        eps = self.dt * DIFFUSION_TERMINAL_TIME_EPS
+        is_final_step = (t_curr + self.dt) >= (1.0 - eps)
+
+        module_output = torch.where(
+            is_final_step,
+            torch.full_like(module_output, -float("inf")),  # This is the exit action
+            module_output,
+        )
+
+        drift = module_output[..., : self.s_dim]
+        if self.n_variance_outputs > 0:
+            var_part = module_output[..., self.s_dim :]
+            # Reduce extra variance dims to a single scalar (isotropic for now).
+            log_std = var_part.mean(dim=-1, keepdim=True)
+            fwd_std = torch.exp(log_std) * math.sqrt(self.dt)
+        else:
+            fwd_std = torch.full(
+                (drift.shape[0], 1), self.sigma * self.dt**0.5, device=drift.device
+            )
+
+        # Match reference behavior: scale diffusion noise (not drift) by t_scale if present.
+        t_scale_factor = getattr(self.module, "t_scale", 1.0)
+        if t_scale_factor != 1.0:
+            fwd_std = fwd_std * math.sqrt(t_scale_factor)
+
+        fwd_mean = self.dt * drift
+
+        # Optional exploration noise: combine variances (quadrature/logaddexp).
+        exploration_std = policy_kwargs.pop("exploration_std", None)
+        exploration_std_t = torch.as_tensor(
+            exploration_std if exploration_std is not None else 0.0,
+            device=fwd_std.device,
+            dtype=fwd_std.dtype,
+        ).clamp(min=0.0)
+
+        # Combine base diffusion variance σ_base^2 with exploration variance σ_expl^2:
+        # σ_combined = sqrt(σ_base^2 + σ_expl^2). torch.compile friendly.
+        base_log_var = 2 * fwd_std.log()  # log(σ_base^2)
+        # 1e-12 clamp prevents log(0) when exploration_std is exactly zero;
+        # the torch.where below ensures fwd_std is unchanged in that case.
+        extra_log_var = 2 * exploration_std_t.clamp(min=1e-12).log()  # log(σ_expl^2)
+        extra_log_var_tensor = extra_log_var.expand_as(base_log_var)
+        combined_log_var = torch.logaddexp(base_log_var, extra_log_var_tensor)
+        fwd_std = torch.where(
+            exploration_std_t > 0,
+            torch.exp(0.5 * combined_log_var),
+            fwd_std,
+        )
+
+        return IsotropicGaussian(fwd_mean, fwd_std)
+
+
+class PinnedBrownianMotionBackward(DiffusionPolicyEstimator):  # TODO: support OU process
+    def __init__(
+        self,
+        s_dim: int,
+        pb_module: nn.Module,
+        sigma: float,
+        num_discretization_steps: int,
+        n_variance_outputs: int = 0,
+        pb_scale_range: float = 0.1,
+    ):
+        """Initialize the PinnedBrownianMotionBackward.
+
+        Args:
+            s_dim: The dimension of the states.
+            pb_module: The neural network module to use for the backward policy.
+            sigma: The diffusion coefficient parameter for the pinned Brownian motion.
+            num_discretization_steps: The number of discretization steps.
+            n_variance_outputs: Number of variance outputs (0=fixed, 1=learned corr).
+            pb_scale_range: Scaling factor applied to learned mean and variance
+                corrections. Bounds effective corrections to [-pb_scale_range,
+                +pb_scale_range] when module outputs are in [-1, 1].
+        """
+        super().__init__(s_dim=s_dim, module=pb_module, is_backward=True)
+
+        # Pinned Brownian Motion related
+        self.sigma = sigma
+        self.dt = 1.0 / num_discretization_steps
+        self.n_variance_outputs = n_variance_outputs
+        self.pb_scale_range = pb_scale_range
+
+    @property
+    def expected_output_dim(self) -> int:
+        # Drift correction (s_dim) plus optional variance correction outputs.
+        return self.s_dim + self.n_variance_outputs
+
+    def forward(self, input: States) -> torch.Tensor:
+        """Forward pass of the module."""
+        out = self.module(self.preprocessor(input))
+
+        if self.expected_output_dim is not None:
+            assert out.shape[-1] == self.expected_output_dim, (
+                f"Module output shape {out.shape} does not match expected output "
+                f"dimension {self.expected_output_dim}"
+            )
+        return out
+
+    def to_probability_distribution(
+        self,
+        states: States,
+        module_output: torch.Tensor,
+        **policy_kwargs: Any,
+        # TODO: add epsilon-noisy exploration
+    ) -> IsotropicGaussian:
+        """Transform the output of the module into a IsotropicGaussian distribution,
+        which is the distribution of the previous states under the pinned Brownian motion
+        process, possibly controlled by the output of the backward module. If the module
+        is a fixed backward module, the `module_output` is a zero vector (no control).
+        Includes optional learned corrections.
+
+        Args:
+            states: The states to use, states.tensor.shape = (*batch_shape, s_dim + 1).
+            module_output: The output of the module (actions), as a tensor of shape
+                (*batch_shape, s_dim).
+            **policy_kwargs: Keyword arguments to modify the distribution.
+
+        Returns:
+            A IsotropicGaussian distribution (distribution of the previous states)
+        """
+        assert len(states.batch_shape) == 1, "States must have a batch_shape of length 1"
+        s_curr = states.tensor[:, :-1]
+        t_curr = states.tensor[:, [-1]]  # shape: (B, 1)
+
+        # Analytic Brownian bridge pinned at s=0, t=0.
+        # The backward action is a = s_t - s_{t-dt}, applied as s_{t-dt} = s_t - a.
+        # E[a] = s_t * dt / t;  Std[a] = σ * sqrt(dt * (t - dt) / t)
+        #
+        # At t=dt these naturally give base_mean=s_curr (deterministic return to origin)
+        # and base_std=0. Clamp t_curr away from zero to avoid division by zero; at t=0
+        # the backward policy is never evaluated (s0 is excluded by get_trajectory_pbs).
+        # Clamp t away from zero to prevent division-by-zero in the Brownian
+        # bridge formula.  The threshold dt*1e-4 is chosen to be well below dt
+        # (so it never triggers for valid t >= dt) while staying above float32
+        # denormal range (~1e-38).
+        t_safe = t_curr.clamp(min=self.dt * 1e-4)
+        base_mean = s_curr * self.dt / t_safe
+        base_std = (
+            self.sigma * (self.dt * (t_safe - self.dt).clamp(min=0.0) / t_safe).sqrt()
+        )
+
+        # Optional learned corrections scaled by pb_scale_range; when n_variance_outputs==0, only mean corr.
+        mean_corr = module_output[..., : self.s_dim] * self.pb_scale_range
+        if self.n_variance_outputs > 0 and module_output.shape[-1] >= self.s_dim + 1:
+            log_std_corr = module_output[..., [-1]] * self.pb_scale_range
+            corr_std = torch.exp(log_std_corr)
+        else:
+            corr_std = torch.zeros_like(base_std)
+
+        bwd_mean = base_mean + mean_corr
+        bwd_std = (base_std**2 + corr_std**2).sqrt()
+
+        return IsotropicGaussian(bwd_mean, bwd_std)

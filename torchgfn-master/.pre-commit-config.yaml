@@ -1,0 +1,49 @@
+---
+exclude: ^benchmark/
+repos:
+  - repo: https://github.com/pycqa/autoflake
+    rev: v2.3.1
+    hooks:
+      - id: autoflake
+        name: autoflake
+        entry: autoflake
+        language: python
+        types: [python]
+        require_serial: true
+        args:
+          - "--in-place"
+          - "--expand-star-imports"
+          - "--remove-duplicate-keys"
+          - "--remove-unused-variables"
+          - "--remove-all-unused-imports"
+          - "--ignore-init-module-imports"
+  - repo: https://github.com/pycqa/isort
+    rev: 6.0.1
+    hooks:
+      - id: isort
+  - repo: https://github.com/python/black
+    rev: 26.3.1
+    hooks:
+      - id: black
+  - repo: https://github.com/PyCQA/flake8
+    rev: 7.1.1
+    hooks:
+      - id: flake8
+  - repo: https://github.com/RobertCraigie/pyright-python
+    rev: v1.1.408
+    hooks:
+      - id: pyright
+        language: system  # Use the system's shell and Python
+        entry: pyright  # Simply call 'pyright'
+        pass_filenames: false
+        always_run: true
+  - repo: local
+    hooks:
+      - id: pytest-check
+        name: pytest-check
+        entry: pytest
+        args: [testing/]
+        language: system
+        pass_filenames: false
+        types: [python]
+        always_run: true

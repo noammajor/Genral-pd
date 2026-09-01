@@ -1,0 +1,7 @@
+# Adapted from DiGress configs/dataset/guacamol.yaml
+name: guacamol
+datadir: 'data/guacamol'
+remove_h: null
+filter: True            # Use filtered version (removes invalid molecules from train)
+adaptive_loader: False
+fraction: 1.0

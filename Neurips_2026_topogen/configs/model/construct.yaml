@@ -1,0 +1,48 @@
+# ConStruct diffusion model settings
+# Mirrors ConStruct/configs/model/discrete.yaml with TopoGen defaults
+
+transition: 'absorbing_edges'   # uniform | marginal | absorbing | absorbing_edges
+diffusion_steps: 500
+n_layers: 5
+
+# Extra features
+extra_features: True
+eigenfeatures: True
+max_degree: 10
+num_eigenvectors: 5
+num_eigenvalues: 9
+num_degree: 10
+extra_molecular_features: True  # only activates when dataset_infos.is_molecular=True
+
+# Architecture dimensions
+# Note: keep dim_ffE moderate — edge tensors are O(n^2) and expensive
+hidden_mlp_dims: {'X': 256, 'E': 128, 'y': 128}
+hidden_dims: {'dx': 256, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 128, 'dim_ffy': 128}
+
+# Loss weights: [X (nodes), C (charges), E (edges), y (global)]
+lambda_train: [1, 2, 5, 0]
+
+nu:
+  x: 1
+  c: 1
+  e: 1
+  y: 1
+
+# Structural projector for constrained generation
+# False = unconstrained (default for all non-topology datasets)
+# planar | tree | lobster = project generated graph at each reverse step
+rev_proj: False
+
+dropout: 0.1
+dropout_in_and_out: False
+cycle_features: True
+
+# --- Topology-conditioned loss (PDM) ---
+# Set use_pdm: True to add the PDM loss term. Has no effect when False.
+use_pdm: False
+alpha_2: 0.001    # weight for L_PDM (paper values: 0.001 comm20/planar, 0.0001 enzymes/sbm)
+
+# --- Topology-Aware Attention Module (TAM) ---
+# Set use_tam: True to inject µ_G₀ as a global attention bias. Has no effect when False.
+use_tam: False
+tam_mu_dim: 1000  # 2 * num_landscapes * resolution = 2 * 5 * 100

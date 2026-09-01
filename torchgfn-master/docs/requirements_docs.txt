@@ -1,0 +1,9 @@
+black
+insegel
+myst-parser
+pre-commit
+pytest
+sphinx_rtd_theme>=2.0
+sphinx-autoapi>=3.0.0
+sphinx-math-dollar
+sphinx<8.0.0

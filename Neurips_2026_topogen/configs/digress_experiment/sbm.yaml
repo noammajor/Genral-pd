@@ -1,0 +1,29 @@
+# @package _global_
+# DiGress-equivalent settings for SBM graphs.
+general:
+    name: 'digress_sbm'
+    wandb: 'disabled'
+    check_val_every_n_epochs: 300
+    samples_to_generate: 32     # = val set size
+    samples_to_save: 9
+    chains_to_save: 1
+    final_model_samples_to_generate: 40  # = test set size
+    final_model_samples_to_save: 20
+    final_model_chains_to_save: 10
+
+train:
+    n_epochs: 100000
+    batch_size: 64
+
+model:
+    diffusion_steps: 500
+    n_layers: 10
+    hidden_mlp_dims: {'X': 128, 'E': 64, 'y': 128}
+    hidden_dims: {'dx': 256, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 64, 'dim_ffy': 256}
+    rev_proj: False
+
+dataset:
+    name: sbm
+    datadir: 'data/sbm'
+    adaptive_loader: False
+    fraction: 1.0

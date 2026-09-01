@@ -1,0 +1,32 @@
+# @package _global_
+# ConStruct settings for GuacaMol (large molecular dataset)
+# batch_size=32: GuacaMol graphs are large (up to 88 heavy atoms), GPU memory constrained (mirrors DiGress)
+general:
+    name: 'construct_guacamol'
+    wandb: 'disabled'
+    check_val_every_n_epochs: 1
+    samples_to_generate: 512
+    samples_to_save: 20
+    chains_to_save: 1
+    final_model_samples_to_generate: 10000
+    final_model_samples_to_save: 30
+    final_model_chains_to_save: 20
+
+train:
+    n_epochs: 1000
+    batch_size: 32
+    num_workers: 4
+
+model:
+    diffusion_steps: 500
+    n_layers: 5
+    hidden_mlp_dims: {'X': 256, 'E': 128, 'y': 128}
+    hidden_dims: {'dx': 256, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 128, 'dim_ffy': 128}
+    rev_proj: False
+
+dataset:
+    name: guacamol
+    datadir: 'data/guacamol'
+    filter: True
+    adaptive_loader: False
+    fraction: 1.0
