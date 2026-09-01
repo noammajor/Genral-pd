@@ -2,9 +2,9 @@
 #SBATCH --job-name=pd-gfn
 #SBATCH --output=logs/gfn_%j.out
 #SBATCH --error=logs/gfn_%j.out
-#SBATCH --time=24:00:00
+#SBATCH --time=72:00:00
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=32G
+#SBATCH --mem=16G
 # NOTE: more MEMORY helps, more CORES does not -- we pin torch to a single
 # thread on purpose (see below), so extra cores sit idle. Raise memory with
 # sbatch --mem=64G ... (shell vars do NOT expand in #SBATCH lines; the
@@ -31,8 +31,11 @@ export MKL_NUM_THREADS=1
 #   SEED=1 sbatch scripts/triton_train.sh comm20 2500     # different seed
 #   sbatch scripts/triton_train.sh comm20 10000 --constant-scorer  # ablation
 #
-# Measured: comm20 ~2.45 s/iteration at batch 32 on one CPU core.
-# enzymes has mean |E| 63.5 vs comm20's 35.7, so expect ~1.8x that.
+# MEASURED (batch 64, micro-batch 8, 1 core):
+#   comm20    5.9 s/epoch, peak RSS 1.0 GB  -> 10000 ep = 16.3 h
+#   enzymes 126.0 s/epoch, peak RSS 4.3 GB  ->  1700 ep = 59.5 h
+#                                                425 ep = 14.9 h
+# Hence --time=72:00:00 (partitions allow 5 days).
 
 set -euo pipefail
 
