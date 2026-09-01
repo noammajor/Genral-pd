@@ -14,8 +14,13 @@ export MKL_NUM_THREADS=1
 
 # Train the PD-compliant graph GFlowNet with trajectory balance.
 #
+# The second argument is EPOCHS = full passes over the training targets.
+# An epoch shuffles all targets and visits each exactly once.
+#   comm20 :  64 train targets / batch 64 =  1 iteration per epoch
+#   enzymes: 376 train targets / batch 64 =  6 iterations per epoch
+#
 #   sbatch scripts/triton_train.sh comm20  10000
-#   sbatch scripts/triton_train.sh enzymes 10000
+#   sbatch scripts/triton_train.sh enzymes  1700
 #   sbatch scripts/triton_train.sh comm20  10000 --constant-scorer   # ablation
 #
 # Measured: comm20 ~2.45 s/iteration at batch 32 on one CPU core.
@@ -24,7 +29,7 @@ export MKL_NUM_THREADS=1
 set -euo pipefail
 
 DATASET="${1:-comm20}"
-NITER="${2:-10000}"
+NEPOCH="${2:-10000}"
 shift 2 2>/dev/null || true
 EXTRA=("$@")
 
@@ -35,17 +40,17 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 mkdir -p logs runs
 
 OUT="runs/${DATASET}_${SLURM_JOB_ID:-local}"
-echo "host=$(hostname) dataset=$DATASET iters=$NITER out=$OUT"
+echo "host=$(hostname) dataset=$DATASET epochs=$NEPOCH out=$OUT"
 echo "extra: ${EXTRA[*]:-<none>}"
 
 srun python3 -m topo_gfn.train \
   --dataset "$DATASET" \
-  --n-iterations "$NITER" \
+  --n-epochs "$NEPOCH" \
   --batch-size 64 \
   --num-emb 128 --num-layers 4 --rank 32 \
   --lr 1e-4 --lr-z 1e-3 \
   --threads 1 \
-  --log-every 50 --ckpt-every 500 \
+  --log-every 0 --ckpt-every 50 \
   --device cpu \
   --out "$OUT" \
   "${EXTRA[@]}"

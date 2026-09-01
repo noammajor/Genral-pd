@@ -61,7 +61,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="comm20")
     ap.add_argument("--data-root", default=None)
-    ap.add_argument("--n-iterations", type=int, default=10000)
+    ap.add_argument("--n-epochs", type=int, default=None,
+                    help="number of FULL PASSES over the training targets. Each "
+                         "epoch shuffles all targets and visits every one exactly "
+                         "once, in batches. Takes precedence over --n-iterations.")
+    ap.add_argument("--n-iterations", type=int, default=10000,
+                    help="total gradient steps; used only if --n-epochs is unset")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--beta", type=float, default=1.0,
                     help="inverse temperature on s(H); 0 = completion-only reward")
@@ -78,8 +83,10 @@ def main():
     ap.add_argument("--lr-z", type=float, default=1e-3,
                     help="logZ gets its own higher LR, as SynFlowNet does")
     ap.add_argument("--grad-clip", type=float, default=10.0)
-    ap.add_argument("--log-every", type=int, default=20)
-    ap.add_argument("--ckpt-every", type=int, default=500)
+    ap.add_argument("--log-every", type=int, default=0,
+                    help="log every N gradient steps; 0 = per-epoch lines only")
+    ap.add_argument("--ckpt-every", type=int, default=50,
+                    help="checkpoint every N EPOCHS")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--threads", type=int, default=1,
@@ -124,46 +131,77 @@ def main():
     sampler = TopoSampler(model)
     algo = TrajectoryBalance(model, scorer, beta=args.beta)
 
-    per_epoch = max(1, len(train) / args.batch_size)
-    print(f"[train] {args.n_iterations} iterations x batch {args.batch_size}"
-          f"  =  {args.n_iterations / per_epoch:.0f} epochs over {len(train)} targets"
-          f"  ({per_epoch:.1f} iterations/epoch)", flush=True)
+    # An epoch is a FULL PASS over the training targets: shuffle, then visit
+    # every target exactly once in batches (the last batch may be short).
+    iters_per_epoch = int(np.ceil(len(train) / args.batch_size))
+    if args.n_epochs is not None:
+        n_epochs = args.n_epochs
+        total_iters = n_epochs * iters_per_epoch
+    else:
+        total_iters = args.n_iterations
+        n_epochs = int(np.ceil(total_iters / iters_per_epoch))
+
+    print(f"[train] {n_epochs} epochs over {len(train)} targets, batch "
+          f"{args.batch_size}  ->  {iters_per_epoch} iteration(s)/epoch, "
+          f"{total_iters} gradient steps total", flush=True)
     print(f"[train] device={args.device}  beta={args.beta}  "
           f"scorer={'constant' if args.constant_scorer else 'descriptor'}", flush=True)
 
-    hist, t0 = [], time.time()
-    for it in range(1, args.n_iterations + 1):
-        pick = rng.integers(0, len(train), size=args.batch_size)
-        envs = [TopoEnv(train[i][0]) for i in pick]
+    hist, t0, it = [], time.time(), 0
+    stop = False
+    for epoch in range(1, n_epochs + 1):
+        if stop:
+            break
+        perm = rng.permutation(len(train))          # full pass, no replacement
+        ep_stats = []
+        for b0 in range(0, len(perm), args.batch_size):
+            it += 1
+            if it > total_iters:
+                stop = True
+                break
+            pick = perm[b0:b0 + args.batch_size]
+            envs = [TopoEnv(train[i][0]) for i in pick]
 
-        trajs = sampler.sample(envs)
-        loss, info = algo.compute_loss(trajs)
+            trajs = sampler.sample(envs)
+            loss, info = algo.compute_loss(trajs)
 
-        opt.zero_grad(set_to_none=True)
-        opt_z.zero_grad(set_to_none=True)
-        loss.backward()
-        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        opt.step()
-        opt_z.step()
+            opt.zero_grad(set_to_none=True)
+            opt_z.zero_grad(set_to_none=True)
+            loss.backward()
+            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            opt.step()
+            opt_z.step()
 
-        info["iter"] = it
-        info["epoch"] = it / per_epoch
-        info["grad_norm"] = float(gn)
-        hist.append(info)
+            info["iter"] = it
+            info["epoch"] = epoch
+            info["n_targets"] = len(pick)
+            info["grad_norm"] = float(gn)
+            hist.append(info)
+            ep_stats.append(info)
 
-        if it % args.log_every == 0 or it == 1:
+            if args.log_every and it % args.log_every == 0:
+                el = time.time() - t0
+                print(f"  it {it:7d} | loss {info['loss']:10.3f} "
+                      f"| logZ {info['logZ']:8.3f} "
+                      f"| complete {info['completion_rate']:5.2f} "
+                      f"| {el/it:.2f}s/it", flush=True)
+
+        if ep_stats:
             el = time.time() - t0
-            print(f"it {it:6d} | ep {info['epoch']:8.1f} | loss {info['loss']:10.3f} "
-                  f"| logZ {info['logZ']:8.3f} | complete {info['completion_rate']:5.2f} "
-                  f"| logR {info['log_r']:8.2f} | steps {info['mean_steps']:5.1f} "
-                  f"| {el/it:.2f}s/it", flush=True)
+            agg = lambda k: float(np.mean([s[k] for s in ep_stats]))
+            print(f"epoch {epoch:6d}/{n_epochs} | it {it:7d} "
+                  f"| loss {agg('loss'):10.3f} | logZ {agg('logZ'):8.3f} "
+                  f"| complete {agg('completion_rate'):5.2f} "
+                  f"| logR {agg('log_r'):8.2f} | steps {agg('mean_steps'):5.1f} "
+                  f"| {el/max(1,epoch):.2f}s/ep", flush=True)
 
-        if it % args.ckpt_every == 0 or it == args.n_iterations:
-            torch.save({"model": model.state_dict(), "args": vars(args), "iter": it},
-                       out / "ckpt.pt")
+        if epoch % args.ckpt_every == 0 or epoch == n_epochs or stop:
+            torch.save({"model": model.state_dict(), "args": vars(args),
+                        "iter": it, "epoch": epoch}, out / "ckpt.pt")
             (out / "history.json").write_text(json.dumps(hist))
 
-    print(f"[done] {time.time()-t0:.0f}s -> {out}", flush=True)
+    print(f"[done] {epoch} epochs, {it} steps, {time.time()-t0:.0f}s -> {out}",
+          flush=True)
 
 
 if __name__ == "__main__":
