@@ -32,12 +32,23 @@ from topo_gen.persistence import persistence_diagrams
 from topo_gfn.actions import PDSchedule
 from topo_gfn.env import TopoEnv
 from topo_gfn.gfn import FAIL_LOGR, TopoSampler, TrajectoryBalance
-from topo_gfn.policy import TopoGFN
+from topo_gfn.policy import TopoGFN, num_node_features, set_feature_mode
 from topo_gfn.score import ConstantScorer, DescriptorScorer
 
 
 def load_targets(dataset: str, split: str, data_root: str, max_nodes: int = None):
-    """Benchmark split -> (PDSchedule, dense adjacency) per graph."""
+    """Benchmark split -> (PDSchedule, dense adjacency) per graph.
+
+    ``dataset`` may be a comma-separated list ("comm20,enzymes"), in which case
+    the splits are concatenated.  Handling it here rather than in main() means
+    a mixed checkpoint records its spec in args["dataset"] and every
+    downstream script (eval, iso_test, digress_metrics) reloads it unchanged.
+    """
+    if "," in dataset:
+        out = []
+        for one in dataset.split(","):
+            out.extend(load_targets(one.strip(), split, data_root, max_nodes))
+        return out
     from utils.dataset_utils import load_split, pyg_to_nx
     out = []
     for d in load_split(data_root, dataset, split):
@@ -100,6 +111,113 @@ def main():
     ap.add_argument("--ckpt-every", type=int, default=50,
                     help="checkpoint every N EPOCHS")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--violation-penalty", type=float, default=None,
+                    help="SOFT constraints. Instead of masking PD-violating "
+                         "moves out, allow any well-formed edge and charge T "
+                         "nats of reward per violation: "
+                         "log R = beta*s(x) - T*violations. The target becomes "
+                         "P(x) ~ exp(s(x) - T*v(x)), so a graph with v "
+                         "violations is e^(-T*v) less likely. T=0 relaxes the "
+                         "PD entirely (ablation); unset keeps the hard mask. "
+                         "Well-formedness (node exists, no duplicate edge, no "
+                         "self-loop) is always enforced.")
+    ap.add_argument("--pd-penalty", type=float, default=0.0,
+                    help="weight on W1(PD(x), PD_target) in the reward. Only "
+                         "meaningful with --mask-temp, where compliance is no "
+                         "longer guaranteed; 0 leaves deviation unpunished.")
+    ap.add_argument("--learn-pb", action="store_true",
+                    help="parameterise the BACKWARD policy instead of using a "
+                         "uniform P_B over the exact parent set. Adds one head "
+                         "per backward action type on the shared encoder, as "
+                         "SynFlowNet's GraphTransformerSynGFN does under "
+                         "do_bck, and fits (P_F, P_B) jointly through the TB "
+                         "residual. Off by default.")
+    ap.add_argument("--score-floor", type=float, default=None,
+                    help="floor on the completed-graph reward beta*s(H). "
+                         "s(H) = -mean(z^2) is unbounded below; on tight "
+                         "datasets it can fall past the -50 dead-end penalty "
+                         "(measured -599 on planar), which trains the policy "
+                         "to fail on purpose. -40 keeps completion strictly "
+                         "better than failing. Off by default.")
+    ap.add_argument("--init-from", default=None,
+                    help="path to a ckpt.pt to fine-tune from")
+    ap.add_argument("--sim-lambda", type=float, default=0.0,
+                    help="weight of the embedding-similarity regulariser "
+                         "(completed graphs vs their reference realisation); "
+                         "0 = off. Requires --init-from: the frozen pretrained "
+                         "encoder anchors the similarity.")
+    ap.add_argument("--spatial-terms", default="diameter",
+                    help="spatial only: which distance-geometry descriptors "
+                         "enter the score (subset of diameter,radius,avg_spl). "
+                         "Component count is deliberately absent: beta_0 is "
+                         "pinned by the PD, so it is constant across a class.")
+    ap.add_argument("--sim-agg",
+                    choices=["match", "pool", "ged", "cycles", "spatial"],
+                    default="match",
+                    help="match: Hungarian-matched cosine of the (N,d) node "
+                         "embeddings. pool: cosine of the pooled graph "
+                         "embedding. ged: NANL-style Sinkhorn soft transport "
+                         "plan + negative L1 feature alignment (a GED proxy). "
+                         "cycles: no embeddings at all -- exact counts of "
+                         "cycles of length 3..kmax vs the reference. spatial: "
+                         "distance geometry (diameter / radius / average "
+                         "shortest path) vs the reference. Neither is "
+                         "differentiable, so reward placement only.")
+    ap.add_argument("--sim-stages", action="store_true",
+                    help="compare the two graphs' FILTRATION HISTORIES stage "
+                         "by stage instead of only the finished graph. A "
+                         "completed graph has degree == node_time and zero "
+                         "capacity by definition, so terminal features are "
+                         "identical across a PD class; mid-filtration states "
+                         "genuinely differ. Ignored by --sim-agg cycles.")
+    ap.add_argument("--cycle-lengths", default="3,4,5",
+                    help="cycles only: which cycle lengths enter the score "
+                         "(subset of 3,4,5). '3' alone is a pure triangle term.")
+    ap.add_argument("--cycle-clip", type=float, default=2.0,
+                    help="cycles only: cap on the per-length relative error. "
+                         "Keeps the term bounded when a reference has zero "
+                         "k-cycles (common on sparse data like ENZYMES), so "
+                         "it can never exceed the -50 dead-end penalty.")
+    ap.add_argument("--cycle-mode", choices=["match", "excess"], default="match",
+                    help="cycles only: match penalises any deviation from the "
+                         "reference count; excess penalises only having MORE "
+                         "than the reference (a one-sided penalty)")
+    ap.add_argument("--sinkhorn-temp", type=float, default=0.1,
+                    help="ged only: Sinkhorn temperature; ->0 sharpens the "
+                         "soft plan toward a hard permutation")
+    ap.add_argument("--sinkhorn-iters", type=int, default=20,
+                    help="ged only: Sinkhorn normalisation iterations")
+    ap.add_argument("--sim-centered", action="store_true",
+                    help="subtract the running class-mean embedding before "
+                         "comparing. Terminal features are identical across a "
+                         "PD class, so ~95%% of the embedding is a shared "
+                         "component and raw cosine pins at ~0.999; centering "
+                         "restores the range.")
+    ap.add_argument("--center-warmup", type=int, default=8,
+                    help="completed graphs per PD to accumulate before the "
+                         "class mean is used (uncentered until then)")
+    ap.add_argument("--features", choices=["basic", "rich"], default="basic",
+                    help="basic: the original 9 node features, which are fixed "
+                         "by the PD once a trajectory completes. rich: adds "
+                         "triangles, clustering, 2-hop reach and mean "
+                         "neighbour degree, which vary within a PD class. "
+                         "NOTE rich changes the input width, so a rich model "
+                         "cannot be initialised from a basic checkpoint.")
+    ap.add_argument("--sim-encoder", choices=["live", "frozen"], default="live",
+                    help="live: the training encoder embeds both sides, the "
+                         "reference under no_grad (stop-gradient anchor). "
+                         "frozen: a frozen copy of the pretrained encoder "
+                         "(stationary reward; ablation).")
+    ap.add_argument("--sim-place", choices=["reward", "loss"], default="reward",
+                    help="reward: log R += lambda*(sim - center) "
+                         "(multiplicative reward shaping, frozen encoder). "
+                         "loss: TB loss -= lambda*sim with gradients through "
+                         "the live encoder.")
+    ap.add_argument("--sim-center", type=float, default=0.0,
+                    help="baseline subtracted from sim in reward mode. Measured "
+                         "pretrained-policy sim is 0.898 +/- 0.018 on comm20, "
+                         "so 0.9 keeps the completion incentive unchanged while "
+                         "lambda scales within-class preference.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--threads", type=int, default=1,
                     help="torch CPU threads. Keep at 1: our tensors are tiny "
@@ -111,6 +229,7 @@ def main():
 
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
+    set_feature_mode(args.features)
     rng = np.random.default_rng(args.seed)
     root = args.data_root or str(Path(__file__).resolve().parents[1] / "data")
     out = Path(args.out or f"runs/{args.dataset}_seed{args.seed}")
@@ -133,15 +252,72 @@ def main():
         (out / "scorer.json").write_text(json.dumps(scorer.to_dict(), indent=1))
 
     model = TopoGFN(num_emb=args.num_emb, num_layers=args.num_layers,
-                    num_mlp_layers=args.num_mlp_layers, rank=args.rank).to(args.device)
+                    num_mlp_layers=args.num_mlp_layers, rank=args.rank,
+                    do_bck=args.learn_pb).to(args.device)
+    if args.init_from:
+        state = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        prev = state.get("args", {}).get("features", "basic")
+        if prev != args.features:
+            raise SystemExit(
+                f"--init-from checkpoint was trained with --features {prev}, "
+                f"but this run asks for {args.features}. The input width "
+                f"differs ({num_node_features(prev)} vs "
+                f"{num_node_features(args.features)}), so the weights do not "
+                f"transfer -- pretrain from scratch with --features "
+                f"{args.features} first.")
+        model.load_state_dict(state["model"])
+        print(f"[init] fine-tuning from {args.init_from} "
+              f"(epoch {state.get('epoch', '?')})", flush=True)
+
+    sim_fn = None
+    if args.sim_lambda:
+        if not args.init_from:
+            raise SystemExit("--sim-lambda needs --init-from (the frozen "
+                             "pretrained encoder anchors the similarity)")
+        from topo_gfn.similarity import EmbedSim
+        if args.sim_agg in ("cycles", "spatial") and args.sim_place == "loss":
+            raise SystemExit(f"--sim-agg {args.sim_agg} is not "
+                             "differentiable; use "
+                             "--sim-place reward (a GFlowNet reward need not "
+                             "be differentiable)")
+        sim_fn = EmbedSim(model.encoder, agg=args.sim_agg,
+                          source=args.sim_encoder,
+                          sinkhorn_temp=args.sinkhorn_temp,
+                          sinkhorn_iters=args.sinkhorn_iters,
+                          centered=args.sim_centered,
+                          center_warmup=args.center_warmup,
+                          stages=args.sim_stages,
+                          cycle_lengths=[int(x) for x in
+                                         args.cycle_lengths.split(",")],
+                          cycle_mode=args.cycle_mode,
+                          cycle_clip=args.cycle_clip,
+                          spatial_terms=[x for x in
+                                         args.spatial_terms.split(",") if x])
+        extra = (f" lengths={args.cycle_lengths} mode={args.cycle_mode}"
+                 if args.sim_agg == "cycles" else
+                 f" terms={args.spatial_terms}"
+                 if args.sim_agg == "spatial" else
+                 f" centered={args.sim_centered} stages={args.sim_stages}"
+                 f" encoder={args.sim_encoder}")
+        print(f"[sim] lambda={args.sim_lambda} agg={args.sim_agg} "
+              f"place={args.sim_place}{extra}", flush=True)
+
     z_params = list(model.mlp_logZ.parameters())
     z_ids = {id(p) for p in z_params}
     body = [p for p in model.parameters() if id(p) not in z_ids]
     opt = torch.optim.Adam(body, lr=args.lr)
     opt_z = torch.optim.Adam(z_params, lr=args.lr_z)
 
-    sampler = TopoSampler(model)
-    algo = TrajectoryBalance(model, scorer, beta=args.beta)
+    soft = args.violation_penalty is not None
+    sampler = TopoSampler(model, soft=soft)
+    algo = TrajectoryBalance(model, scorer, beta=args.beta,
+                             sim_fn=sim_fn, sim_lambda=args.sim_lambda,
+                             sim_place=args.sim_place,
+                             sim_center=args.sim_center,
+                             score_floor=args.score_floor,
+                             pd_penalty=args.pd_penalty, soft=soft,
+                             violation_penalty=(args.violation_penalty or 0.0),
+                             learn_pb=args.learn_pb)
 
     # An epoch is a FULL PASS over the training targets: shuffle, then visit
     # every target exactly once in batches (the last batch may be short).
@@ -156,8 +332,16 @@ def main():
     print(f"[train] {n_epochs} epochs over {len(train)} targets, batch "
           f"{args.batch_size}  ->  {iters_per_epoch} iteration(s)/epoch, "
           f"{total_iters} gradient steps total", flush=True)
+    if args.learn_pb:
+        print("[train] learned backward policy (P_B parameterised, not uniform)",
+              flush=True)
+    if soft:
+        print(f"[train] SOFT constraints: violation_penalty="
+              f"{args.violation_penalty} pd_penalty={args.pd_penalty}",
+              flush=True)
     print(f"[train] device={args.device}  beta={args.beta}  "
-          f"scorer={'constant' if args.constant_scorer else 'descriptor'}", flush=True)
+          f"scorer={'constant' if args.constant_scorer else 'descriptor'}  "
+          f"features={args.features} ({num_node_features()} per node)", flush=True)
 
     hist, t0, it = [], time.time(), 0
     stop = False
@@ -185,6 +369,8 @@ def main():
                 stop = True
                 break
             envs = [TopoEnv(train[i][0]) for i in pick]
+            for e, i in zip(envs, pick):
+                e.ref_adj = train[i][1]      # reference realisation of the PD
 
             trajs = sampler.sample(envs)
 
@@ -212,12 +398,18 @@ def main():
 
         if ep_stats:
             el = time.time() - t0
-            agg = lambda k: float(np.mean([s[k] for s in ep_stats]))
+            agg = lambda k: float(np.mean([s[k] for s in ep_stats if k in s]))
+            sim_str = (f"| sim {agg('sim'):6.3f} "
+                       if any("sim" in s for s in ep_stats) else "")
+            if any(s.get("violations") for s in ep_stats):
+                sim_str += f"| viol {agg('violations'):5.1f} "
+            if any("pd_dev" in s for s in ep_stats):
+                sim_str += f"| pdW1 {agg('pd_dev'):6.2f} "
             print(f"epoch {epoch:6d}/{n_epochs} | it {it:7d} "
                   f"| loss {agg('loss'):10.3f} | logZ {agg('logZ'):8.3f} "
                   f"| complete {agg('completion_rate'):5.2f} "
                   f"| logR {agg('log_r'):8.2f} | steps {agg('mean_steps'):5.1f} "
-                  f"| {el/max(1,epoch):.2f}s/ep", flush=True)
+                  f"{sim_str}| {el/max(1,epoch):.2f}s/ep", flush=True)
 
         if epoch % args.ckpt_every == 0 or epoch == n_epochs or stop:
             torch.save({"model": model.state_dict(), "args": vars(args),

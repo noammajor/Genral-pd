@@ -118,16 +118,34 @@ class TopoEnv:
 
     # -- construction -------------------------------------------------------
 
-    def new(self) -> State:
-        return self.empty_graph()
+    def new(self, soft: bool = False) -> State:
+        return self.empty_graph(soft=soft)
 
-    def empty_graph(self) -> State:
+    def empty_graph(self, soft: bool = False) -> State:
         s = State(sched=self.sched)
-        self._advance(s)
+        self._advance(s, soft=soft)
         return s
 
-    def _advance(self, s: State) -> None:
-        """Skip timesteps whose quotas are already spent (in place)."""
+    def _advance(self, s: State, soft: bool = False) -> None:
+        """Move the filtration clock forward (in place).
+
+        Hard mode: skip timesteps whose quotas are already spent.
+
+        Soft mode: quota satisfaction can no longer drive the clock, because a
+        violating move consumes no quota -- the clock would freeze at the first
+        timestep the policy declines to serve, no later vertex would ever be
+        born, and the rollout would pile edges onto one stage forever (measured:
+        k stuck at 4, only 12 of 14 vertices ever existing).  So the clock is
+        driven by EDGE COUNT instead: timestep k gets exactly the number of
+        edges the PD prescribes for it, whichever edges the policy picks, and
+        the mismatch is what `violations` records.
+        """
+        if soft:
+            from topo_gfn.actions import edges_due_at
+            while s.k < s.sched.n and s.k_edges >= edges_due_at(s.sched, s.k):
+                s.k += 1
+                s.k_edges = 0
+            return
         while (s.k < s.sched.n
                and s.deaths_rem[s.k].sum() == 0
                and s.cycles_rem[s.k] == 0):
@@ -135,10 +153,18 @@ class TopoEnv:
 
     # -- forward ------------------------------------------------------------
 
-    def step(self, s: State, action: GraphAction) -> State:
-        """Apply an action, returning the next state.  Does not mutate ``s``."""
+    def step(self, s: State, action: GraphAction, soft: bool = False) -> State:
+        """Apply an action, returning the next state.  Does not mutate ``s``.
+
+        Under ``soft=True`` the PD-compliance requirements (capacity, quota,
+        born-this-timestep) are no longer enforced: the move is executed
+        anyway, the corresponding quota is decremented only if one is actually
+        available, and ``s.violations`` counts what was overspent.  The result
+        is a well-formed graph whose persistence diagram may differ from the
+        target -- the reward, not the mask, is what discourages that.
+        """
         if action.action is GraphActionType.Stop:
-            if not s.done:
+            if not (s.done or soft):
                 raise ValueError("Stop is only legal once all quotas are spent")
             return s.copy()
 
@@ -146,23 +172,33 @@ class TopoEnv:
         out = s.copy()
 
         if action.action is GraphActionType.Merge:
-            if not merge_mask(s)[u, v]:
+            if not soft and not merge_mask(s)[u, v]:
                 raise ValueError(f"illegal Merge ({u},{v}) at k={s.k}")
             _, cb = s.components()
             b = int(cb[u])                       # u is the DYING side
-            out.deaths_rem[s.k, b] -= 1
+            if not soft or (b >= 0 and out.deaths_rem[s.k, b] > 0):
+                out.deaths_rem[s.k, b] -= 1
+            else:
+                out.violations += 1              # no death quota to spend
             code = edge_code_of(s.k, is_cycle=False)
         elif action.action is GraphActionType.Cycle:
-            if not cycle_mask(s)[u, v]:
+            if not soft and not cycle_mask(s)[u, v]:
                 raise ValueError(f"illegal Cycle ({u},{v}) at k={s.k}")
-            out.cycles_rem[s.k] -= 1
+            if not soft or out.cycles_rem[s.k] > 0:
+                out.cycles_rem[s.k] -= 1
+            else:
+                out.violations += 1              # no cycle quota to spend
             code = edge_code_of(s.k, is_cycle=True)
         else:
             raise ValueError(f"{action.action} is not a forward action")
 
+        if soft and (s.capacity[u] <= 0 or s.capacity[v] <= 0):
+            out.violations += 1                  # degree will exceed node_time
+
         out.adj[u, v] = out.adj[v, u] = True
         out.edge_code[u, v] = out.edge_code[v, u] = code
-        self._advance(out)
+        out.k_edges += 1
+        self._advance(out, soft=soft)
         return out
 
     # -- backward -----------------------------------------------------------

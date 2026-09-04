@@ -202,6 +202,8 @@ class State:
     edge_code: np.ndarray = field(default=None)   # (N,N) int, -1 where no edge
     deaths_rem: np.ndarray = field(default=None)  # (n+1, n+1) int
     cycles_rem: np.ndarray = field(default=None)  # (n+1,) int
+    violations: int = 0          # soft mode: quota/capacity overspends so far
+    k_edges: int = 0             # soft mode: edges placed at the current k
 
     def __post_init__(self):
         N = self.sched.num_nodes
@@ -271,7 +273,8 @@ class State:
 
     @property
     def done(self) -> bool:
-        return self.deaths_rem.sum() == 0 and self.cycles_rem.sum() == 0
+        # <= rather than == : soft mode can overspend a quota into the negative
+        return self.deaths_rem.sum() <= 0 and self.cycles_rem.sum() <= 0
 
     def edge_list(self) -> list:
         iu, iv = np.triu_indices(self.sched.num_nodes, 1)
@@ -283,6 +286,7 @@ class State:
             sched=self.sched, k=self.k,
             adj=self.adj.copy(), edge_code=self.edge_code.copy(),
             deaths_rem=self.deaths_rem.copy(), cycles_rem=self.cycles_rem.copy(),
+            violations=self.violations, k_edges=self.k_edges,
         )
 
 
@@ -339,6 +343,78 @@ def cycle_mask(s: State) -> np.ndarray:
     )
 
 
+# ---------------------------------------------------------------------------
+# Soft (penalised) masks
+#
+# The strict masks above encode two very different kinds of requirement:
+#
+#   WELL-FORMEDNESS  both endpoints exist, no duplicate edge, no self-loop, and
+#                    the merge/cycle distinction (which is a FACT about the
+#                    current graph, not a choice: a pair in one component can
+#                    only close a cycle).  Violating these produces nonsense
+#                    rather than an approximate graph, so they stay hard.
+#
+#   PD COMPLIANCE    remaining capacity, remaining death/cycle quota, and the
+#                    "born this timestep" filtration ordering.  These are what
+#                    make the output match the target diagram.  Relaxing them
+#                    yields a well-formed graph with an approximate PD, which
+#                    is the point of soft-constraint generation.
+#
+# So the soft masks below drop the compliance requirements and keep only
+# well-formedness; the sampler penalises the difference by the mask
+# temperature instead of forbidding it.
+# ---------------------------------------------------------------------------
+
+def _hard_pair_mask(s: State) -> np.ndarray:
+    """Well-formedness only: both endpoints exist, no edge yet, no self-loop."""
+    ex = s.exists
+    return (
+        ex[:, None] & ex[None, :]
+        & ~s.adj
+        & ~np.eye(s.sched.num_nodes, dtype=bool)
+    )
+
+
+def soft_merge_mask(s: State) -> np.ndarray:
+    """Pairs in DIFFERENT components, ignoring quota/capacity/new-vertex."""
+    comp_id, _ = s.components()
+    return (_hard_pair_mask(s)
+            & (comp_id[:, None] != comp_id[None, :])
+            & (comp_id[:, None] >= 0) & (comp_id[None, :] >= 0))
+
+
+def soft_cycle_mask(s: State) -> np.ndarray:
+    """Pairs in the SAME component, ignoring quota/capacity."""
+    comp_id, _ = s.components()
+    return (_hard_pair_mask(s)
+            & (comp_id[:, None] == comp_id[None, :])
+            & (comp_id[:, None] >= 0))
+
+
+def edges_due_at(sched, k: int) -> int:
+    """How many edges the PD prescribes for timestep k."""
+    return int(sched.deaths[k].sum() + sched.cycles[k])
+
+
+def soft_type_mask(s: State, action_type_order=None) -> np.ndarray:
+    """Primary-head mask under soft constraints.
+
+    Stop becomes legal once the PD's edge budget is spent, so a soft
+    trajectory always terminates instead of dead-ending.
+    """
+    order = action_type_order or DEFAULT_ACTION_TYPE_ORDER
+    budget_spent = s.edges_placed >= s.sched.num_edges
+    out = np.zeros(len(order), dtype=bool)
+    for i, t in enumerate(order):
+        if t is GraphActionType.Stop:
+            out[i] = bool(s.done or budget_spent)
+        elif t is GraphActionType.Merge:
+            out[i] = (not budget_spent) and bool(soft_merge_mask(s).any())
+        elif t is GraphActionType.Cycle:
+            out[i] = (not budget_spent) and bool(soft_cycle_mask(s).any())
+    return out
+
+
 def stop_mask(s: State) -> np.ndarray:
     """(1,1) bool -- Stop is legal only once every quota is spent."""
     return np.array([[s.done]], dtype=bool)
@@ -362,6 +438,23 @@ def type_mask(s: State, action_type_order=None) -> np.ndarray:
     return out
 
 
+def bck_type_mask(s: State, action_type_order=None) -> np.ndarray:
+    """Primary-head mask for the BACKWARD policy.
+
+    Mirrors ``type_mask`` but over ``DEFAULT_BCK_ACTION_TYPE_ORDER``: a backward
+    move type is legal iff it has at least one removable edge.  There is no
+    backward Stop -- the initial state is reached when no edge remains.
+    """
+    order = action_type_order or DEFAULT_BCK_ACTION_TYPE_ORDER
+    out = np.zeros(len(order), dtype=bool)
+    for i, t in enumerate(order):
+        if t is GraphActionType.BckMerge:
+            out[i] = bool(bck_merge_mask(s).any())
+        elif t is GraphActionType.BckCycle:
+            out[i] = bool(bck_cycle_mask(s).any())
+    return out
+
+
 def is_dead_end(s: State) -> bool:
     """Quotas remain but no move is legal.  Terminal with zero reward; common
     enough that the policy needs an explicit always-available fallback."""
@@ -371,10 +464,52 @@ def is_dead_end(s: State) -> bool:
 # -- backward -----------------------------------------------------------------
 
 def _removable(s: State) -> np.ndarray:
-    """(N,N) bool: edges attaining the maximum code -- the exact parent set."""
+    """(N,N) bool: edges that could have been the LAST one added.
+
+    The forward policy is free to interleave Merge and Cycle within a timestep,
+    so the parent set cannot be "edges attaining the maximum CODE".  Codes are
+    ``2k + is_cycle``, so that rule silently assumes every cycle at timestep k
+    was placed after every merge at k -- and a merge chosen after a cycle then
+    has code 2k < 2k+1, is not enumerated as a parent edge, and its forward
+    transition becomes irreversible.  Measured on comm20: 21.5% of forward
+    transitions, every one of them a Merge whose child's maximum code was the
+    matching Cycle.
+
+    The exact set for the free-interleaving DAG is instead:
+
+      * candidates are the edges at the maximum TIMESTEP;
+      * a cycle edge is always removable -- deleting it cannot change any
+        component, so every other edge keeps its recorded type;
+      * a merge edge is removable unless some cycle edge at that same timestep
+        relies on the connection it provides: after the removal that cycle
+        would join two different components, contradicting its stored code.
+
+    Merges at one timestep commute (they form a forest over the contracted
+    component graph), so a merge never blocks another merge.
+    """
     if s.edges_placed == 0:
         return np.zeros_like(s.adj)
-    return (s.edge_code == s.edge_code.max()) & s.adj
+    code = s.edge_code
+    has = s.adj & (code >= 0)
+    kmax = int(code[has].max()) // 2
+    at_k = has & (code // 2 == kmax)
+    is_cycle = at_k & (code % 2 == 1)
+    is_merge = at_k & (code % 2 == 0)
+    if not is_merge.any() or not is_cycle.any():
+        return at_k                      # nothing can be blocked
+
+    iu, iv = np.triu_indices(s.sched.num_nodes, 1)
+    cyc_pairs = [(int(u), int(v)) for u, v in zip(iu, iv) if is_cycle[u, v]]
+    out = at_k.copy()
+    for u, v in zip(iu, iv):
+        if not is_merge[u, v]:
+            continue
+        probe = s.copy()
+        probe.adj[u, v] = probe.adj[v, u] = False
+        cid, _ = probe.components()
+        if any(cid[a] != cid[b] for a, b in cyc_pairs):
+            out[u, v] = out[v, u] = False
+    return out
 
 
 def bck_merge_mask(s: State) -> np.ndarray:

@@ -31,6 +31,13 @@ export MKL_NUM_THREADS=1
 #   SEED=1 sbatch scripts/triton_train.sh comm20 2500     # different seed
 #   sbatch scripts/triton_train.sh comm20 10000 --constant-scorer  # ablation
 #
+# Fine-tune with the embedding-similarity regulariser (completed graphs are
+# pulled toward the reference realisation; sim of node embeddings, Hungarian
+# matched, added to log R):
+#   sbatch scripts/triton_train.sh comm20 500 \
+#     --init-from runs/comm20_ep2500_seed0_20026585/ckpt.pt \
+#     --sim-lambda 50 --sim-center 0.9
+#
 # MEASURED (batch 64, micro-batch 8, 1 core):
 #   comm20    5.9 s/epoch, peak RSS 1.0 GB  -> 10000 ep = 16.3 h
 #   enzymes 126.0 s/epoch, peak RSS 4.3 GB  ->  1700 ep = 59.5 h

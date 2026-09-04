@@ -44,11 +44,47 @@ from topo_gfn.actions import (
     State,
     cycle_mask,
     merge_mask,
+    soft_cycle_mask,
+    soft_merge_mask,
+    bck_cycle_mask,
+    bck_merge_mask,
+    bck_type_mask,
+    soft_type_mask,
     type_mask,
 )
+from topo_gfn.actions import DEFAULT_BCK_ACTION_TYPE_ORDER
 
-# number of per-node input features produced by state_features()
-NUM_NODE_FEATURES = 9
+# Per-node input features produced by state_features().
+#
+# "basic" is the original 9.  At a TERMINAL state they are a function of the
+# PD alone -- degree == node_time, capacity == 0, everything exists -- so every
+# PD-compliant graph gets a bit-identical feature matrix and the encoder can
+# only tell them apart through message passing, which leaves the difference at
+# ~4% of the embedding norm.  "rich" appends four structural quantities that
+# genuinely vary within a PD-equivalence class, so terminal states of different
+# compliant graphs are distinguishable at the input.
+BASIC_NODE_FEATURES = 9
+RICH_NODE_FEATURES = 13
+
+# Module-level mode, so the many batch_states() call sites (sampler, TB loss,
+# similarity, eval scripts) do not each have to thread a flag through.  It is
+# recorded in the checkpoint and restored by whatever loads one.
+FEATURE_MODE = "basic"
+
+
+def set_feature_mode(mode: str) -> None:
+    global FEATURE_MODE
+    assert mode in ("basic", "rich")
+    FEATURE_MODE = mode
+
+
+def num_node_features(mode: str = None) -> int:
+    return (RICH_NODE_FEATURES if (mode or FEATURE_MODE) == "rich"
+            else BASIC_NODE_FEATURES)
+
+
+# Back-compat alias: modules that imported the constant still work in basic mode.
+NUM_NODE_FEATURES = BASIC_NODE_FEATURES
 
 
 def mlp(n_in, n_hid, n_out, n_layer, act=nn.LeakyReLU):
@@ -66,12 +102,17 @@ def mlp(n_in, n_hid, n_out, n_layer, act=nn.LeakyReLU):
 # ---------------------------------------------------------------------------
 
 def state_features(s: State) -> np.ndarray:
-    """(N, NUM_NODE_FEATURES) float32 node features for one state.
+    """(N, num_node_features()) float32 node features for one state.
 
     Everything here is derivable from the state, but handing the network the
     quantities the masks are built from means it does not have to rediscover
     them.  Capacity is the important one: it is what the winning heuristic keys
     on, and what running out of causes NO_CYCLE_CANDIDATE dead ends.
+
+    In "rich" mode four local-structure features are appended.  The nine basic
+    ones are fixed by the PD once a trajectory completes, so they cannot say
+    whether a compliant graph is well shaped or merely legal; these four vary
+    across the PD-equivalence class and carry that signal.
     """
     N = s.sched.num_nodes
     nt = s.sched.node_time.astype(np.float32)
@@ -83,7 +124,7 @@ def state_features(s: State) -> np.ndarray:
     comp_size = np.array([size_of.get(int(c), 0) for c in comp_id], dtype=np.float32)
 
     scale = max(1.0, float(s.sched.n))
-    feats = np.stack([
+    cols = [
         nt / scale,                                  # intended degree (= birth)
         deg / scale,                                 # current degree
         cap / scale,                                 # remaining capacity  <-- key
@@ -93,8 +134,25 @@ def state_features(s: State) -> np.ndarray:
         np.where(cb >= 0, cb, -1).astype(np.float32) / scale,   # component birth
         comp_size / max(1.0, N),                     # component size
         np.full(N, s.k / scale, dtype=np.float32),   # current timestep
-    ], axis=1)
-    return feats.astype(np.float32)
+    ]
+
+    if FEATURE_MODE == "rich":
+        A = s.adj.astype(np.float32)
+        A2 = A @ A                                   # one matmul serves all four
+        tri = (A * A2).sum(1) / 2.0                  # triangles through v
+        pairs = deg * (deg - 1) / 2.0
+        clust = np.divide(tri, pairs, out=np.zeros_like(tri), where=pairs > 0)
+        two_hop = ((A2 > 0) & (A == 0)).sum(1).astype(np.float32)
+        two_hop[np.arange(N)] -= (A2[np.arange(N), np.arange(N)] > 0)
+        nbr_deg = np.divide(A @ deg, np.maximum(deg, 1.0))
+        cols += [
+            tri / max(1.0, N),                       # triangle count
+            clust,                                   # clustering coefficient
+            two_hop / max(1.0, N),                   # 2-hop reach
+            nbr_deg / scale,                         # mean neighbour degree
+        ]
+
+    return np.stack(cols, axis=1).astype(np.float32)
 
 
 def batch_states(states: List[State]):
@@ -106,7 +164,7 @@ def batch_states(states: List[State]):
     """
     B = len(states)
     Nmax = max(s.sched.num_nodes for s in states)
-    x = np.zeros((B, Nmax, NUM_NODE_FEATURES), dtype=np.float32)
+    x = np.zeros((B, Nmax, num_node_features()), dtype=np.float32)
     adj = np.zeros((B, Nmax, Nmax), dtype=np.float32)
     nm = np.zeros((B, Nmax), dtype=bool)
     for i, s in enumerate(states):
@@ -117,8 +175,14 @@ def batch_states(states: List[State]):
     return (torch.from_numpy(x), torch.from_numpy(adj), torch.from_numpy(nm))
 
 
-def batch_masks(states: List[State], action_type_order=None):
-    """Padded (type, merge, cycle) masks for a list of states, as bool tensors."""
+def batch_masks(states: List[State], action_type_order=None, soft: bool = False):
+    """Padded (type, merge, cycle) masks for a list of states, as bool tensors.
+
+    ``soft=True`` returns the WELL-FORMEDNESS masks instead of the strict ones:
+    every pair that could physically take an edge, whether or not it respects
+    the PD's quotas and capacities.  The sampler penalises the difference
+    between the two rather than forbidding it.
+    """
     order = action_type_order or DEFAULT_ACTION_TYPE_ORDER
     B = len(states)
     Nmax = max(s.sched.num_nodes for s in states)
@@ -127,9 +191,25 @@ def batch_masks(states: List[State], action_type_order=None):
     cm = np.zeros((B, Nmax, Nmax), dtype=bool)
     for i, s in enumerate(states):
         n = s.sched.num_nodes
-        tm[i] = type_mask(s, order)
-        mm[i, :n, :n] = merge_mask(s)
-        cm[i, :n, :n] = cycle_mask(s)
+        tm[i] = soft_type_mask(s, order) if soft else type_mask(s, order)
+        mm[i, :n, :n] = soft_merge_mask(s) if soft else merge_mask(s)
+        cm[i, :n, :n] = soft_cycle_mask(s) if soft else cycle_mask(s)
+    return (torch.from_numpy(tm), torch.from_numpy(mm), torch.from_numpy(cm))
+
+
+def batch_bck_masks(states: List[State], action_type_order=None):
+    """Padded (type, merge, cycle) masks for the BACKWARD policy."""
+    order = action_type_order or DEFAULT_BCK_ACTION_TYPE_ORDER
+    B = len(states)
+    Nmax = max(s.sched.num_nodes for s in states)
+    tm = np.zeros((B, len(order)), dtype=bool)
+    mm = np.zeros((B, Nmax, Nmax), dtype=bool)
+    cm = np.zeros((B, Nmax, Nmax), dtype=bool)
+    for i, s in enumerate(states):
+        n = s.sched.num_nodes
+        tm[i] = bck_type_mask(s, order)
+        mm[i, :n, :n] = bck_merge_mask(s)
+        cm[i, :n, :n] = bck_cycle_mask(s)
     return (torch.from_numpy(tm), torch.from_numpy(mm), torch.from_numpy(cm))
 
 
@@ -183,9 +263,11 @@ class TopoGFN(nn.Module):
     """
 
     def __init__(self, num_emb: int = 128, num_layers: int = 4,
-                 num_mlp_layers: int = 1, rank: int = 32, num_cond: int = 0):
+                 num_mlp_layers: int = 1, rank: int = 32, num_cond: int = 0,
+                 num_in: int = None, do_bck: bool = False):
         super().__init__()
-        self.encoder = DenseGNN(NUM_NODE_FEATURES, num_emb, num_layers, num_cond)
+        self.num_in = num_in or num_node_features()
+        self.encoder = DenseGNN(self.num_in, num_emb, num_layers, num_cond)
         self.num_cond = num_cond
 
         # primary head: one logit per forward action type
@@ -197,6 +279,20 @@ class TopoGFN(nn.Module):
         self.cycle_p = mlp(num_emb, num_emb, rank, num_mlp_layers)   # symmetric
         self.rank = rank
 
+        # Backward policy, built like SynFlowNet's: the SAME encoder embedding
+        # feeds a separate head per backward action type, created only when
+        # do_bck is set (their GraphTransformerSynGFN chains
+        # action_type_order with bck_action_type_order under `if do_bck`).
+        # Without it P_B stays uniform over the exact parent set.
+        self.do_bck = do_bck
+        if do_bck:
+            self.mlp_type_bck = mlp(num_emb, num_emb,
+                                    len(DEFAULT_BCK_ACTION_TYPE_ORDER),
+                                    num_mlp_layers)
+            self.bck_merge_l = mlp(num_emb, num_emb, rank, num_mlp_layers)
+            self.bck_merge_r = mlp(num_emb, num_emb, rank, num_mlp_layers)
+            self.bck_cycle_p = mlp(num_emb, num_emb, rank, num_mlp_layers)
+
         self.mlp_logZ = mlp(max(1, num_cond), num_emb, 1, 2)
 
     def forward(self, x, adj, node_mask, cond=None):
@@ -205,6 +301,16 @@ class TopoGFN(nn.Module):
         ml, mr = self.merge_l(h), self.merge_r(h)                    # (B,N,r)
         merge_logits = torch.bmm(ml, mr.transpose(1, 2)) / self.rank ** 0.5
         cp = self.cycle_p(h)
+        cycle_logits = torch.bmm(cp, cp.transpose(1, 2)) / self.rank ** 0.5
+        return type_logits, merge_logits, cycle_logits
+
+    def forward_bck(self, x, adj, node_mask, cond=None):
+        """Backward logits from the same encoder (requires do_bck)."""
+        h, h_g = self.encoder(x, adj, node_mask, cond)
+        type_logits = self.mlp_type_bck(h_g)                         # (B, 2)
+        ml, mr = self.bck_merge_l(h), self.bck_merge_r(h)
+        merge_logits = torch.bmm(ml, mr.transpose(1, 2)) / self.rank ** 0.5
+        cp = self.bck_cycle_p(h)
         cycle_logits = torch.bmm(cp, cp.transpose(1, 2)) / self.rank ** 0.5
         return type_logits, merge_logits, cycle_logits
 
@@ -231,15 +337,35 @@ class TopoActionCategorical:
     def __init__(self, type_logits, merge_logits, cycle_logits,
                  type_mask_t, merge_mask_t, cycle_mask_t,
                  action_type_order=None):
+        """Masked two-level categorical.
+
+        The masks passed in decide the support: the STRICT masks give the
+        original hard-constrained MDP, the well-formedness masks
+        (``batch_masks(..., soft=True)``) give the relaxed one.  Nothing is
+        penalised here -- under soft constraints the cost of a violation lives
+        in the REWARD (``log R -= T * violations``), not in the logits.
+
+        That placement matters.  A logit penalty would change the sampler
+        without changing the target distribution, so rollouts would be
+        off-policy, and the loss (which recomputes log P_F from the model)
+        would disagree with the sampler -- a violating action masked out at
+        loss time gives log P_F = -inf and an infinite TB loss.  Penalising the
+        reward instead keeps P_F consistent and makes the target explicit:
+        P(x) proportional to exp(s(x) - T * violations(x)).
+        """
         self.order = action_type_order or DEFAULT_ACTION_TYPE_ORDER
         self.dev = type_logits.device
         NEG = -torch.inf
         self.type_logits = type_logits.masked_fill(~type_mask_t.to(self.dev), NEG)
         self.merge_logits = merge_logits.masked_fill(~merge_mask_t.to(self.dev), NEG)
         self.cycle_logits = cycle_logits.masked_fill(~cycle_mask_t.to(self.dev), NEG)
-        self.i_merge = self.order.index(GraphActionType.Merge)
-        self.i_cycle = self.order.index(GraphActionType.Cycle)
-        self.i_stop = self.order.index(GraphActionType.Stop)
+        idx = lambda t: self.order.index(t) if t in self.order else -1
+        # the backward order has no Stop, so these may be absent
+        self.i_merge = max(idx(GraphActionType.Merge),
+                           idx(GraphActionType.BckMerge))
+        self.i_cycle = max(idx(GraphActionType.Cycle),
+                           idx(GraphActionType.BckCycle))
+        self.i_stop = idx(GraphActionType.Stop)
 
     # -- level 1 ------------------------------------------------------------
 
